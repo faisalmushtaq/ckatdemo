@@ -10,6 +10,7 @@ Health*, 26, 101664.
 | Path | Purpose |
 | --- | --- |
 | `R/run_maihda_analysis.R` | The analysis. Runs end to end and writes every table and figure. |
+| `R/generate_manuscript.R` | Reads the analysis output and writes a complete Methods and Results section with the actual values in place. |
 | `tools/make_simulated_analysis_master.R` | Builds a simulated `analysis_master` with the same schema, for development and testing without patient data. |
 
 ## Running it
@@ -139,6 +140,56 @@ Everything is written beneath `MAIHDA_OUTPUT_ROOT`, indexed by
 - `figures/individual/`, `figures/multipanel/` — PNG and SVG
 - `models/` — fitted `glmer` objects
 - `logs/` — run log, completion summary, `sessionInfo()`
+
+## Generating the write-up
+
+After the analysis has run:
+
+```bash
+MAIHDA_OUTPUT_ROOT=/path/to/outputs Rscript R/generate_manuscript.R
+```
+
+This reads the analysis CSVs and writes `Manuscript.docx`, `.md` and `.txt`
+containing a complete Methods and Results section with the actual values
+substituted in. Nothing is recomputed — every figure is read from the analysis
+tables, so the text and the results tables cannot drift apart.
+
+It adapts to the run it is given: the axes, categories, reference levels,
+thresholds, outcomes and software versions all come from the output, so
+changing the analysis needs no change here. It also handles the cases that
+matter — a Model B variance at zero is described as a substantive finding, and
+a run with no interactions surviving FDR correction produces a properly worded
+null result rather than an empty section.
+
+### Study metadata
+
+Some Methods content cannot come from the analysis: data source, setting,
+inclusion criteria, ethics approval. Set these in section 1 of the script or
+via `MANUSCRIPT_*` environment variables. Anything left unset appears in the
+text as a conspicuous `[PLACEHOLDER: ...]` marker **and** is listed in
+`placeholders_to_complete.txt`, so nothing can be missed on a read-through.
+
+### Disclosure control
+
+The generated text names individual strata and quotes counts within them,
+which is what a TRE output checker will scrutinise. `MANUSCRIPT_DISCLOSURE_MODE`
+controls this:
+
+| Mode | Behaviour |
+| --- | --- |
+| `flag` (default) | Report true values, and list every figure derived from a cell below the threshold in `disclosure_check.csv`. Use while drafting. |
+| `apply` | Suppress or round small counts in the text itself. Use for the version that leaves the environment. |
+| `off` | No disclosure processing. Only appropriate outside a TRE. |
+
+`MANUSCRIPT_DISCLOSURE_THRESHOLD` defaults to the analysis minimum cell size.
+Set `MANUSCRIPT_DISCLOSURE_ROUNDING=5` for the common round-to-nearest-5 rule;
+in that case *all* counts are rounded, not only small ones, since a mix of
+exact and rounded figures lets an exact value be recovered by difference.
+
+Every run also writes `manuscript_values.csv` — each headline figure quoted in
+the text with its source table and column — so any number can be traced back
+without re-reading the prose, and an output checker has a single list to work
+from.
 
 ## Requirements
 
