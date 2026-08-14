@@ -55,15 +55,38 @@ two.
 
 ## Models
 
-For each outcome:
+The standard MAIHDA sequence, for each outcome:
 
-- **Model A** — `outcome ~ 1 + (1 | stratum)`. Total between-stratum variation.
-- **Model B** — `outcome ~ additive main effects + (1 | stratum)`. The
-  remaining stratum random effects are the intersectional interaction
-  residuals.
+- **Model A** (simple intersectional) — `outcome ~ 1 + (1 | stratum)`. Total
+  between-stratum variation.
+- **Model 2 family** (partially adjusted) — one model per axis, each adding a
+  single axis to Model A. The PCV from each isolates that axis's contribution
+  to the between-stratum variance. This is what identifies *which* dimension
+  drives the variation; Model A and Model B alone cannot. Contributions
+  overlap and do not sum, because the axes are correlated.
+- **Model B** (intersectional interaction) — `outcome ~ additive main effects
+  + (1 | stratum)`. The remaining stratum random effects are the
+  intersectional interaction residuals.
 
 Outcomes are collapsed to one binomial record per stratum before fitting,
 which retains the exact binomial likelihood.
+
+Per stratum we report the **absolute risk (AR)** and the **absolute risk due
+to interaction (ARI)** — total predicted risk minus additive-only predicted
+risk — using the terminology of the applied MAIHDA literature.
+
+VPC, MOR and the variance components carry **profile-likelihood 95%
+intervals**, the maximum-likelihood counterpart of the credible intervals that
+Bayesian MAIHDA analyses report.
+
+### Estimation
+
+Much of the MAIHDA literature uses Bayesian MCMC (brms/Stan, or MLwiN via
+`runmlwin`). This uses maximum likelihood with the Laplace approximation:
+deterministic, no priors or convergence diagnostics, and therefore easier to
+audit and reproduce inside a TRE. The minimum cell size rule also removes the
+smallest strata, which is where the two approaches would most likely diverge.
+The generated Methods states and justifies this explicitly.
 
 ## Minimum cell size
 
@@ -106,6 +129,15 @@ each analysis. Panel E and Table 9 present only strata significant at
 `MAIHDA_FDR_LEVEL` (default 0.05); `all_stratum_predictions.csv` retains every
 stratum with both the corrected and uncorrected flags.
 
+**Note that this is more conservative than the field norm.** The MAIHDA
+literature generally argues that precision-weighted shrinkage *is* the
+multiplicity control, and is more efficient than Bonferroni-type corrections
+because it does not sacrifice power. Applying FDR on top of shrinkage risks
+understating the number of interactions rather than overstating it. The
+generated Methods says so explicitly. Raise `MAIHDA_FDR_LEVEL`, or filter on
+`interaction_distinguishable` instead of `interaction_distinguishable_fdr`, to
+move closer to the conventional treatment.
+
 ## Settings
 
 All settings are environment variables.
@@ -119,6 +151,8 @@ All settings are environment variables.
 | `MAIHDA_MIN_STRATUM_EVENTS` | `0` | Minimum stratum events |
 | `MAIHDA_MIN_RETAINED_STRATA` | `20` | Abandon an analysis below this many strata |
 | `MAIHDA_THRESHOLD_SENSITIVITY` | `1` | Run the minimum-cell sweep |
+| `MAIHDA_AXIS_DECOMPOSITION` | `1` | Fit the Model 2 family (per-axis PCV) |
+| `MAIHDA_VARIANCE_INTERVALS` | `1` | Profile-likelihood CIs for VPC/MOR |
 | `MAIHDA_FDR_LEVEL` | `0.05` | Benjamini-Hochberg level |
 | `MAIHDA_NAGQ` | `1` | glmer `nAGQ` |
 | `MAIHDA_SAVE_MODELS` | `1` | Save fitted model objects |

@@ -207,6 +207,8 @@ input_audit <- read_analysis_table("input_audit")
 # itself a reportable result rather than an error.
 significant <- read_analysis_table("distinguishable_interaction_strata",
                                    required = FALSE)
+axis_decomposition <- read_analysis_table("axis_variance_decomposition",
+                                          required = FALSE)
 sensitivity <- read_analysis_table("minimum_cell_sensitivity", required = FALSE)
 failures <- read_analysis_table("failed_analyses", required = FALSE)
 event_rates <- read_analysis_table("descriptive_event_rates_by_category",
@@ -327,6 +329,24 @@ outcome_in_sentence <- function(label) {
   rewritten <- sub(",\\s*(\\d+)\\s*-?\\s*days?$", " within \\1 days", label)
   tolower(rewritten)
 }
+
+# Appends a confidence interval only when one was successfully computed, so a
+# run without profile intervals degrades to a bare point estimate rather than
+# printing "(95% CI NA to NA)".
+interval_suffix <- function(low, high, digits = 1, percent = FALSE) {
+  if (length(low) == 0L || length(high) == 0L || is.na(low) || is.na(high)) {
+    return("")
+  }
+  formatter <- if (percent) function(x) fmt_pct(x, digits) else
+    function(x) fmt_num(x, if (percent) digits else 2)
+  paste0(" (95% CI ", formatter(low), " to ", formatter(high), ")")
+}
+
+# Published VPC values for health outcomes, from the systematic review by
+# Keller and colleagues (2023). Used only to give the reader a sense of scale.
+VPC_BENCHMARK_LOW <- 0.5
+VPC_BENCHMARK_HIGH <- 41.9
+VPC_BENCHMARK_MEDIAN <- 5.5
 
 # The magnitude qualifier is derived from the value rather than asserted, so
 # the text cannot describe a 2% variance partition coefficient as substantial.
@@ -624,13 +644,37 @@ build_methods <- function() {
       "outcome into between-stratum and within-stratum components and so ",
       "quantifies the total between-stratum heterogeneity."
     ),
+    if (!is.null(axis_decomposition)) {
+      paste0(
+        "The Model 2 family comprised a set of partially adjusted models, each ",
+        "adding a single stratum axis to Model A while retaining the stratum ",
+        "random intercept. Comparing the between-stratum variance of each of ",
+        "these against Model A isolates the contribution of that axis alone to ",
+        "the between-stratum variation. Because the axes are correlated in the ",
+        "population, these contributions overlap and do not sum to the fully ",
+        "adjusted value; they are reported individually rather than as a ",
+        "decomposition of a total."
+      )
+    } else NULL,
     paste0(
-      "Model B added the additive main effects of each stratum axis as fixed ",
+      "Model B, the fully adjusted or intersectional interaction model, added ",
+      "the additive main effects of every stratum axis simultaneously as fixed ",
       "effects, retaining the stratum random intercept. Because the fixed ",
       "effects reproduce the purely additive expectation for each stratum, the ",
       "remaining random effects represent departures from that additive ",
       "prediction, and within the MAIHDA framework are interpreted as ",
-      "intersectional interaction residuals."
+      "intersectional interaction residuals. This sequence corresponds to the ",
+      "simple intersectional, partially adjusted and intersectional ",
+      "interaction models described in the applied MAIHDA literature."
+    ),
+    paste0(
+      "For each stratum we report the absolute risk, being the model-predicted ",
+      "probability of the outcome, and the absolute risk due to interaction ",
+      "(ARI), being the total predicted risk minus the risk predicted by the ",
+      "additive main effects alone. A positive ARI indicates that individuals ",
+      "in that stratum carry more risk than the simple addition of the risks ",
+      "conveyed by their constituent social and clinical positions would imply; ",
+      "a negative ARI indicates less."
     ),
     paste0(
       "From each model we derived the variance partition coefficient (VPC), ",
@@ -663,6 +707,23 @@ build_methods <- function() {
       ") with the bobyqa optimiser."
     ),
     paste0(
+      "Much of the applied MAIHDA literature estimates these models in a ",
+      "Bayesian framework using Markov chain Monte Carlo, which yields ",
+      "credible intervals for the variance components directly from the ",
+      "posterior and can be better behaved when many strata are small. We used ",
+      "maximum likelihood, which the methodological tutorial literature also ",
+      "supports, because it is deterministic, requires no prior specification ",
+      "or convergence diagnostics, and is therefore more straightforward to ",
+      "audit and reproduce within a trusted research environment. The ",
+      "minimum cell size rule applied here also removes the smallest strata, ",
+      "which is where the two approaches would be most likely to diverge. ",
+      "Uncertainty in the variance components was quantified by ",
+      "profile-likelihood intervals on the random-effect standard deviation, ",
+      "transformed to the variance, variance partition coefficient and median ",
+      "odds ratio scales; all three transformations are monotonic, so the ",
+      "interval endpoints carry across directly."
+    ),
+    paste0(
       "Where a random-intercept variance was estimated at the zero boundary, ",
       "we refitted the model with alternative optimisers to distinguish a ",
       "genuine boundary solution from a failure of optimisation. A boundary ",
@@ -686,13 +747,26 @@ build_methods <- function() {
       "approximate."
     ),
     paste0(
-      "Because each analysis compares several hundred strata simultaneously, ",
-      "an uncorrected interval excluding zero is not on its own evidence of an ",
-      "intersectional interaction. We therefore applied Benjamini-Hochberg ",
-      "false discovery rate correction across the strata within each analysis ",
-      "and report as interactions only those strata significant at a false ",
-      "discovery rate of ", fmt_num(FDR_LEVEL, 2), ". Uncorrected results are ",
-      "retained in the supplementary output for completeness."
+      "The multilevel model already provides a degree of protection against ",
+      "spurious findings: the random effects are precision-weighted, so that ",
+      "estimates for strata with small samples are shrunk towards the additive ",
+      "prediction, and this shrinkage has been argued to be a more efficient ",
+      "control of the multiple comparisons problem than inflating intervals ",
+      "through a Bonferroni-type correction, because it does not sacrifice ",
+      "power to detect genuine differences."
+    ),
+    paste0(
+      "Because each analysis nonetheless compares several hundred strata ",
+      "simultaneously, we additionally applied Benjamini-Hochberg false ",
+      "discovery rate correction across the strata within each analysis, and ",
+      "report as interactions only those strata significant at a false ",
+      "discovery rate of ", fmt_num(FDR_LEVEL, 2), ". This is a deliberately ",
+      "conservative choice, and more conservative than is usual in the applied ",
+      "MAIHDA literature, which commonly relies on shrinkage alone. It ",
+      "therefore risks understating the number of interactions rather than ",
+      "overstating it. Both the corrected and the uncorrected results are ",
+      "reported in the supplementary output so that the effect of this choice ",
+      "is fully visible."
     )
   )
 
@@ -884,9 +958,12 @@ build_results <- function() {
       ", giving a variance partition coefficient of ",
       stat_value(primary$vpc_model_a_percent, "Model A VPC, primary outcome",
                  "all_model_metrics", "vpc_model_a_percent", 1, percent = TRUE),
+      interval_suffix(primary$vpc_model_a_low, primary$vpc_model_a_high,
+                      percent = TRUE),
       " and a median odds ratio of ",
       stat_value(primary$mor_model_a, "Model A MOR, primary outcome",
                  "all_model_metrics", "mor_model_a", 2),
+      interval_suffix(primary$mor_model_a_low, primary$mor_model_a_high),
       ". The median odds ratio indicates that two otherwise identical ",
       "individuals drawn at random from a higher- and a lower-risk stratum ",
       "would differ in their odds of the outcome by a median factor of ",
@@ -901,8 +978,81 @@ build_results <- function() {
       "greatest for ", outcome_in_sentence(highest_vpc$outcome_label), " (VPC ",
       fmt_pct(highest_vpc$vpc_model_a_percent), "). Model A results for all ",
       "outcomes are given in Table 6."
+    ),
+    # A variance partition coefficient is hard to judge in isolation, so it is
+    # placed against the range reported in the published MAIHDA literature.
+    paste0(
+      "For context, a systematic review of published MAIHDA analyses of ",
+      "health outcomes reported variance partition coefficients ranging from ",
+      fmt_pct(VPC_BENCHMARK_LOW), " to ", fmt_pct(VPC_BENCHMARK_HIGH),
+      ", with a median of ", fmt_pct(VPC_BENCHMARK_MEDIAN),
+      ". The values observed here therefore sit ",
+      if (median(metrics$vpc_model_a_percent, na.rm = TRUE) >
+          VPC_BENCHMARK_MEDIAN) {
+        "above the median of previously published analyses"
+      } else {
+        "at or below the median of previously published analyses"
+      },
+      ", indicating that these intersectional strata capture ",
+      if (median(metrics$vpc_model_a_percent, na.rm = TRUE) >
+          VPC_BENCHMARK_MEDIAN) {
+        "an unusually large share of the total individual variation relative to comparable studies"
+      } else {
+        "a share of the total individual variation comparable to that seen in the wider literature"
+      },
+      "."
     )
   )
+
+  # --- Which axis drives the variation --------------------------------------
+  if (!is.null(axis_decomposition)) {
+    primary_decomposition <- axis_decomposition[
+      axis_decomposition$outcome == PRIMARY_OUTCOME &
+        axis_decomposition$status == "fitted", , drop = FALSE
+    ]
+    if (nrow(primary_decomposition) > 0L) {
+      ordered_axes <- primary_decomposition[
+        order(-primary_decomposition$pcv_percent), , drop = FALSE
+      ]
+      described <- vapply(seq_len(nrow(ordered_axes)), function(index) {
+        row <- ordered_axes[index, ]
+        paste0(label_in_sentence(row$axis_label), " (",
+               fmt_pct(row$pcv_percent), ")")
+      }, character(1))
+
+      # Consistency across outcomes is worth stating explicitly, because a
+      # decomposition that reorders itself for every outcome means something
+      # quite different from one that is stable.
+      leading_by_outcome <- do.call(rbind, lapply(
+        split(axis_decomposition[axis_decomposition$status == "fitted", ],
+              axis_decomposition$outcome[axis_decomposition$status == "fitted"]),
+        function(group) group[which.max(group$pcv_percent), ]
+      ))
+      leading_counts <- sort(table(leading_by_outcome$axis_label),
+                             decreasing = TRUE)
+      consistency <- if (length(leading_counts) == 1L) {
+        paste0(" The same axis was the largest single contributor for every ",
+               "outcome examined.")
+      } else {
+        paste0(" ", capitalise_first(label_in_sentence(names(leading_counts)[1L])),
+               " was the largest single contributor for ",
+               fmt_n(leading_counts[[1L]]), " of ", fmt_n(n_outcomes),
+               " outcomes.")
+      }
+
+      sections[["Contribution of individual axes"]] <- paste0(
+        "Adding each axis separately to the null model identified which ",
+        "dimensions of social and clinical position account for the ",
+        "between-stratum variation. For ", outcome_in_sentence(primary_label),
+        ", the proportional reduction in between-stratum variance attributable ",
+        "to each axis alone was ", oxford(described),
+        ". Because the axes are correlated in the population these ",
+        "contributions overlap and do not sum to the fully adjusted value.",
+        consistency,
+        " Full results are given in Table 10."
+      )
+    }
+  }
 
   # --- Model B main effects -------------------------------------------------
   primary_effects <- fixed_effects[
@@ -1019,7 +1169,7 @@ build_results <- function() {
           "; ",
           disclose_count(row$events, paste0("Stratum events: ", row$stratum),
                          "distinguishable_interaction_strata", "events"),
-          " events) had an observed risk ",
+          " events) carried an absolute risk due to interaction of ",
           fmt_num(abs(100 * row$interaction_probability_difference), 1),
           " percentage points ", direction,
           " than its additive prediction (95% CI ",
@@ -1096,7 +1246,16 @@ build_results <- function() {
       "). This represents an absolute difference of ",
       fmt_num(100 * (highest$total_probability - lowest$total_probability), 1),
       " percentage points between the extremes of the intersectional ",
-      "distribution. The ", fmt_n(nrow(primary_extremes) / 2),
+      "distribution",
+      if (!is.null(primary$absolute_risk_ratio) &&
+          !is.na(primary$absolute_risk_ratio)) {
+        paste0(", a relative difference of ",
+               stat_value(primary$absolute_risk_ratio,
+                          "Absolute risk ratio, extremes",
+                          "all_model_metrics", "absolute_risk_ratio", 1),
+               "-fold")
+      } else "",
+      ". The ", fmt_n(nrow(primary_extremes) / 2),
       " highest- and lowest-risk strata for each outcome are given in Table 8."
     )
   }

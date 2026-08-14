@@ -207,10 +207,48 @@ RUN_THRESHOLD_SENSITIVITY <- env_flag("MAIHDA_THRESHOLD_SENSITIVITY",
                                       default = TRUE)
 SENSITIVITY_THRESHOLDS <- c(0, 5, 10, 20, 30, 50)
 
+# --- Model 2: per-axis variance decomposition -------------------------------
+# The established MAIHDA model sequence (Persmark et al. 2019; Merlo and
+# colleagues) is a family of three, not a pair:
+#
+#   Model 1  null / simple intersectional              (our Model A)
+#   Model 2  partially adjusted, ONE axis at a time    (added here)
+#   Model 3  fully adjusted, all additive main effects (our Model B)
+#
+# The Model 2 family is what identifies WHICH axis drives the between-stratum
+# variance. Fitting Model A and Model B alone establishes that between-stratum
+# variation is largely additive but says nothing about its composition; a PCV
+# of 97% could be almost entirely frailty, or evenly spread across all five
+# axes, and those imply very different things substantively.
+#
+# One model is fitted per axis per outcome, so this multiplies the fitting work
+# by roughly the number of axes. It is well worth it, but it is the first thing
+# to switch off when iterating.
+RUN_AXIS_DECOMPOSITION <- env_flag("MAIHDA_AXIS_DECOMPOSITION", default = TRUE)
+
+# --- Uncertainty intervals for the variance components ----------------------
+# Published MAIHDA analyses report the VPC with an interval, which Bayesian
+# estimation supplies directly from the posterior. Under maximum likelihood the
+# equivalent is a profile-likelihood interval on the random-effect standard
+# deviation, transformed to the variance, VPC and MOR scales. All three
+# transformations are monotonic, so the interval endpoints carry across
+# directly.
+#
+# Profiling costs a further optimisation per model and can be slow on the
+# largest specifications; it fails gracefully to NA rather than stopping a run.
+RUN_VARIANCE_INTERVALS <- env_flag("MAIHDA_VARIANCE_INTERVALS", default = TRUE)
+
 # --- Numerical and output settings ------------------------------------------
 # Tolerance used consistently for every singularity test, so that the metrics
 # table, the log and the figure captions cannot disagree with one another.
 SINGULAR_TOLERANCE <- 1e-5
+
+# Published VPC values for health outcomes, used only to contextualise the
+# results. Range and median across the 21 applied MAIHDA studies reviewed by
+# Keller and colleagues (2023), Educational Psychology Review 35:31.
+VPC_BENCHMARK_LOW <- 0.5
+VPC_BENCHMARK_HIGH <- 41.9
+VPC_BENCHMARK_MEDIAN <- 5.5
 
 # Multiplicity control for the stratum interaction residuals. Twelve outcomes
 # times two specifications times several hundred strata generates a great many
@@ -905,6 +943,51 @@ median_odds_ratio <- function(variance) {
   exp(qnorm(0.75) * sqrt(2 * variance))
 }
 
+# Profile-likelihood interval for the random-intercept variance, and for the
+# VPC and MOR derived from it. lme4 profiles the standard deviation on the
+# theta scale; because variance, VPC and MOR are all monotonic increasing
+# functions of that standard deviation, the interval endpoints transform
+# directly without needing a delta-method approximation.
+#
+# A variance at the zero boundary has a lower limit of zero by construction,
+# which is correct and is reported as such rather than suppressed.
+variance_interval <- function(model, level = 0.95) {
+  empty <- list(
+    variance_low = NA_real_, variance_high = NA_real_,
+    vpc_low = NA_real_, vpc_high = NA_real_,
+    mor_low = NA_real_, mor_high = NA_real_,
+    interval_method = "not computed"
+  )
+  if (!RUN_VARIANCE_INTERVALS) return(empty)
+
+  profiled <- tryCatch(
+    suppressWarnings(suppressMessages(
+      confint(model, parm = "theta_", method = "profile", level = level,
+              oldNames = FALSE)
+    )),
+    error = function(condition) NULL
+  )
+  if (is.null(profiled) || !is.matrix(profiled) || nrow(profiled) == 0L) {
+    empty$interval_method <- "profile failed"
+    return(empty)
+  }
+
+  standard_deviations <- as.numeric(profiled[1L, ])
+  if (anyNA(standard_deviations)) {
+    empty$interval_method <- "profile failed"
+    return(empty)
+  }
+  variances <- pmax(0, standard_deviations^2)
+  list(
+    variance_low = variances[1L], variance_high = variances[2L],
+    vpc_low = 100 * logistic_vpc(variances[1L]),
+    vpc_high = 100 * logistic_vpc(variances[2L]),
+    mor_low = median_odds_ratio(variances[1L]),
+    mor_high = median_odds_ratio(variances[2L]),
+    interval_method = "profile likelihood"
+  )
+}
+
 extract_convergence_message <- function(model) {
   messages <- model@optinfo$conv$lme4$messages
   if (is.null(messages) || length(messages) == 0L) "OK" else
@@ -1169,12 +1252,21 @@ make_stratum_predictions <- function(model_a, model_b, strata_data,
       interaction_log_odds_se = random_se_b,
       interaction_log_odds_low = random_effect_b - 1.96 * random_se_b,
       interaction_log_odds_high = random_effect_b + 1.96 * random_se_b,
+      # This quantity is the absolute risk due to interaction (ARI) of Merlo,
+      # Persmark and colleagues: the total predicted risk for the stratum minus
+      # the risk predicted by the additive main effects alone. A positive value
+      # means the stratum carries more risk than the simple addition of its
+      # constituent positions implies. The literature name is carried in the
+      # output alongside the descriptive one so the tables can be read directly
+      # against published MAIHDA analyses.
       interaction_probability_difference =
         total_probability - additive_probability,
       interaction_probability_difference_low =
         inv_logit(fixed_eta_b + interaction_log_odds_low) - additive_probability,
       interaction_probability_difference_high =
         inv_logit(fixed_eta_b + interaction_log_odds_high) - additive_probability,
+      absolute_risk = total_probability,
+      absolute_risk_due_to_interaction = interaction_probability_difference,
       # The z statistic treats the conditional mode and its conditional
       # standard deviation as an approximate Wald quantity. This is the usual
       # applied convention and is what the interval on the figures shows.
@@ -1213,6 +1305,7 @@ make_stratum_predictions <- function(model_a, model_b, strata_data,
       interaction_probability_difference,
       interaction_probability_difference_low,
       interaction_probability_difference_high,
+      absolute_risk, absolute_risk_due_to_interaction,
       interaction_z, interaction_p_value, interaction_q_value,
       interaction_distinguishable, interaction_distinguishable_fdr,
       prediction_rank, interaction_rank
@@ -1432,6 +1525,53 @@ build_model_formulae <- function(model_axes) {
   list(a = formula_a, b = formula_b)
 }
 
+# --- Model 2 family: per-axis variance decomposition -------------------------
+# One partially adjusted model per axis, each adding a single axis to the null
+# model. The proportional change in variance from Model A gives that axis's
+# individual contribution to the between-stratum variance.
+#
+# The contributions do not sum to the Model B PCV, and are not meant to: the
+# axes are correlated in the population, so their separate contributions
+# overlap. Reporting them alongside the joint Model B figure is what makes the
+# overlap visible, and the sum is deliberately not presented as a total.
+fit_axis_decomposition <- function(strata, model_axes, variance_a,
+                                   specification, specification_label,
+                                   outcome, outcome_label) {
+  if (!RUN_AXIS_DECOMPOSITION || length(model_axes) == 0L) return(NULL)
+
+  bind_rows(lapply(model_axes, function(axis) {
+    axis_formula <- as.formula(paste(
+      "cbind(events, non_events) ~", axis, "+ (1 | stratum)"
+    ))
+    attempt <- tryCatch(
+      fit_glmer_robust(axis_formula, strata, paste0("Model 2: ", axis)),
+      error = function(condition) NULL
+    )
+    if (is.null(attempt)) {
+      return(data.frame(
+        specification = specification, specification_label = specification_label,
+        outcome = outcome, outcome_label = outcome_label,
+        axis = axis, axis_label = display_name_for(axis),
+        variance_model_2 = NA_real_, vpc_model_2_percent = NA_real_,
+        pcv_percent = NA_real_, singular = NA, status = "fit failed"
+      ))
+    }
+    variance_2 <- random_intercept_variance(attempt$model)
+    data.frame(
+      specification = specification, specification_label = specification_label,
+      outcome = outcome, outcome_label = outcome_label,
+      axis = axis, axis_label = display_name_for(axis),
+      variance_model_2 = variance_2,
+      vpc_model_2_percent = 100 * logistic_vpc(variance_2),
+      pcv_percent = if (is.finite(variance_a) && variance_a > 0) {
+        100 * (variance_a - variance_2) / variance_a
+      } else NA_real_,
+      singular = attempt$singular,
+      status = "fitted"
+    )
+  }))
+}
+
 fit_one_maihda <- function(strata, axes, model_axes, specification,
                            specification_label, outcome, outcome_label,
                            included_n, excluded_n, possible_strata,
@@ -1474,6 +1614,23 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
                 level = "NOTE")
   }
 
+  interval_a <- variance_interval(model_a)
+  interval_b <- variance_interval(model_b)
+
+  axis_decomposition <- fit_axis_decomposition(
+    strata, model_axes, variance_a, specification, specification_label,
+    outcome, outcome_label
+  )
+  if (!is.null(axis_decomposition)) {
+    ranked_axes <- axis_decomposition[
+      order(-axis_decomposition$pcv_percent), , drop = FALSE
+    ]
+    leading <- ranked_axes[1L, ]
+    log_message("    Largest single-axis contribution: ", leading$axis_label,
+                " (PCV ", formatC(leading$pcv_percent, format = "f", digits = 1),
+                "%)")
+  }
+
   predictions <- make_stratum_predictions(
     model_a, model_b, strata, axes, specification, specification_label,
     outcome, outcome_label
@@ -1506,12 +1663,23 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     event_n = sum(strata$events),
     event_percent = 100 * sum(strata$events) / sum(strata$n),
     variance_model_a = variance_a,
+    variance_model_a_low = interval_a$variance_low,
+    variance_model_a_high = interval_a$variance_high,
     variance_model_b = variance_b,
+    variance_model_b_low = interval_b$variance_low,
+    variance_model_b_high = interval_b$variance_high,
     vpc_model_a_percent = 100 * logistic_vpc(variance_a),
+    vpc_model_a_low = interval_a$vpc_low,
+    vpc_model_a_high = interval_a$vpc_high,
     vpc_model_b_percent = 100 * logistic_vpc(variance_b),
+    vpc_model_b_low = interval_b$vpc_low,
+    vpc_model_b_high = interval_b$vpc_high,
     pcv_percent = pcv,
     mor_model_a = median_odds_ratio(variance_a),
+    mor_model_a_low = interval_a$mor_low,
+    mor_model_a_high = interval_a$mor_high,
     mor_model_b = median_odds_ratio(variance_b),
+    interval_method = interval_a$interval_method,
     auc_model_a_total = auc_for("null_total_probability"),
     auc_model_a_fixed = auc_for("null_fixed_probability"),
     auc_model_b_total = auc_for("total_probability"),
@@ -1522,6 +1690,17 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     aic_model_b = AIC(model_b),
     n_distinguishable = sum(predictions$interaction_distinguishable),
     n_distinguishable_fdr = sum(predictions$interaction_distinguishable_fdr),
+    # The ratio of the extremes is how the applied MAIHDA literature conveys
+    # the width of the intersectional gradient ("the highest risk was ten times
+    # the lowest"). The absolute difference alone understates a gradient in a
+    # rare outcome and overstates one in a common outcome.
+    lowest_absolute_risk = min(predictions$total_probability),
+    highest_absolute_risk = max(predictions$total_probability),
+    absolute_risk_difference = max(predictions$total_probability) -
+      min(predictions$total_probability),
+    absolute_risk_ratio = if (min(predictions$total_probability) > 0) {
+      max(predictions$total_probability) / min(predictions$total_probability)
+    } else NA_real_,
     optimizer_model_a = fit_a$optimizer,
     optimizer_model_b = fit_b$optimizer,
     singular_model_a = fit_a$singular,
@@ -1571,6 +1750,7 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     fixed_effects = fixed_effects,
     predictions = predictions,
     fit_attempts = fit_attempts,
+    axis_decomposition = axis_decomposition,
     strata = strata
   )
 }
@@ -2094,6 +2274,7 @@ all_retention <- list()
 all_excluded_strata <- list()
 all_reference_changes <- list()
 all_fit_attempts <- list()
+all_axis_decomposition <- list()
 all_failures <- list()
 all_figure_failures <- list()
 sensitivity_results <- list()
@@ -2228,6 +2409,7 @@ for (specification_name in names(SPECIFICATIONS)) {
         all_metrics[[result_key]] <- fit$metrics
         all_fixed_effects[[result_key]] <- fit$fixed_effects
         all_fit_attempts[[result_key]] <- fit$fit_attempts
+        all_axis_decomposition[[result_key]] <- fit$axis_decomposition
         labelled_predictions <- add_condition_labels(fit$predictions)
         all_predictions[[result_key]] <- labelled_predictions
 
@@ -2403,6 +2585,7 @@ retention_table <- bind_rows(all_retention)
 excluded_strata_table <- bind_rows(all_excluded_strata)
 reference_changes_table <- bind_rows(all_reference_changes)
 fit_attempts_table <- bind_rows(all_fit_attempts)
+axis_decomposition_table <- bind_rows(all_axis_decomposition)
 failures_table <- bind_rows(all_failures)
 figure_failures_table <- bind_rows(all_figure_failures)
 
@@ -2425,6 +2608,11 @@ write_csv_output(retention_table,
                  file.path(OUTPUT_ROOT, "tables", "stratum_retention.csv"))
 write_csv_output(fit_attempts_table,
                  file.path(OUTPUT_ROOT, "tables", "model_fit_attempts.csv"))
+if (nrow(axis_decomposition_table) > 0L) {
+  write_csv_output(axis_decomposition_table,
+                   file.path(OUTPUT_ROOT, "tables",
+                             "axis_variance_decomposition.csv"))
+}
 if (nrow(excluded_strata_table) > 0L) {
   write_csv_output(excluded_strata_table,
                    file.path(OUTPUT_ROOT, "tables", "excluded_strata.csv"))
@@ -2669,6 +2857,19 @@ word_retention <- retention_table %>%
     `Largest excluded n` = format_integer(excluded_max_n)
   )
 
+word_axis_decomposition <- if (nrow(axis_decomposition_table) > 0L) {
+  axis_decomposition_table %>%
+    transmute(
+      Outcome = outcome_label,
+      Axis = axis_label,
+      `VPC (%)` = format_number(vpc_model_2_percent, 2),
+      `PCV (%)` = format_number(pcv_percent, 2),
+      Status = ifelse(status == "fitted", "", status)
+    )
+} else {
+  NULL
+}
+
 word_model_metrics <- metrics_table %>%
   transmute(
     Specification = specification_label,
@@ -2677,6 +2878,11 @@ word_model_metrics <- metrics_table %>%
     `Analysed N` = format_integer(analysed_n),
     `Event %` = format_number(event_percent, 2),
     `VPC A (%)` = format_number(vpc_model_a_percent, 2),
+    `VPC A 95% CI` = ifelse(
+      is.na(vpc_model_a_low), "",
+      paste0(format_number(vpc_model_a_low, 2), " to ",
+             format_number(vpc_model_a_high, 2))
+    ),
     `VPC B (%)` = format_number(vpc_model_b_percent, 2),
     `PCV (%)` = format_number(pcv_percent, 2),
     `MOR A` = format_number(mor_model_a, 2),
@@ -2849,9 +3055,27 @@ word_tables <- list(
        filename = "Table_9_significant_interactions.docx", font_size = 7.5)
 )
 
+if (!is.null(word_axis_decomposition)) {
+  word_tables[[length(word_tables) + 1L]] <- list(
+    number = length(word_tables) + 1L,
+    title = "Contribution of Each Axis to Between-Stratum Variance",
+    data = word_axis_decomposition,
+    note = paste(
+      "Each row reports a partially adjusted model containing the null model",
+      "plus a single axis (the Model 2 family of the standard MAIHDA",
+      "sequence). PCV is the proportional reduction in between-stratum",
+      "variance attributable to that axis alone. Contributions overlap and do",
+      "not sum to the fully adjusted PCV, because the axes are correlated in",
+      "the population."
+    ),
+    filename = "Table_10_axis_variance_decomposition.docx", font_size = 8
+  )
+}
+
 if (!is.null(word_sensitivity)) {
   word_tables[[length(word_tables) + 1L]] <- list(
-    number = 10, title = "Sensitivity to the Minimum Cell Size Threshold",
+    number = length(word_tables) + 1L,
+    title = "Sensitivity to the Minimum Cell Size Threshold",
     data = word_sensitivity,
     note = paste(
       "Models A and B refitted at each candidate minimum stratum size for a",
@@ -2859,7 +3083,7 @@ if (!is.null(word_sensitivity)) {
       "retaining a similar share of the cohort indicates that the result is",
       "sensitive to the trimming rule and should be reported as such."
     ),
-    filename = "Table_10_minimum_cell_sensitivity.docx", font_size = 8
+    filename = "Table_11_minimum_cell_sensitivity.docx", font_size = 8
   )
 }
 
@@ -3057,6 +3281,74 @@ save_plot_pair(p_retention,
                file.path(OUTPUT_ROOT, "figures", "individual",
                          "summary__stratum_retention"),
                width = 12, height = 8)
+
+# --- Which axis drives the between-stratum variance -------------------------
+# The single most useful decomposition in the whole analysis: Model B tells you
+# that between-stratum variation is largely additive, and this tells you what
+# it is additive in.
+if (nrow(axis_decomposition_table) > 0L) {
+  p_axis_decomposition <- ggplot(
+    axis_decomposition_table %>% filter(status == "fitted"),
+    aes(x = pcv_percent, y = reorder(axis_label, pcv_percent),
+        colour = outcome_label)
+  ) +
+    geom_point(size = 2.4, alpha = 0.85) +
+    scale_x_continuous(limits = c(0, NA)) +
+    labs(
+      title = "Contribution of each axis to between-stratum variance",
+      subtitle = paste(
+        "Proportional change in variance when each axis alone is added to the",
+        "null model.\nContributions overlap and are not additive, because the",
+        "axes are correlated in the population."
+      ),
+      x = "PCV from the null model (%)", y = NULL, colour = NULL
+    ) + publication_theme +
+    theme(legend.position = "right",
+          legend.text = element_text(size = 8))
+
+  save_plot_pair(p_axis_decomposition,
+                 file.path(OUTPUT_ROOT, "figures", "individual",
+                           "summary__axis_variance_decomposition"),
+                 width = 12, height = 7)
+}
+
+# --- VPC in the context of the published literature -------------------------
+# A VPC is difficult to judge in isolation. Plotting the observed values
+# against the range reported across published MAIHDA health analyses gives the
+# reader an immediate sense of whether this cohort is unusual.
+p_vpc_benchmark <- ggplot(
+  metrics_table,
+  aes(x = vpc_model_a_percent, y = reorder(outcome_label, vpc_model_a_percent))
+) +
+  annotate("rect", xmin = VPC_BENCHMARK_LOW, xmax = VPC_BENCHMARK_HIGH,
+           ymin = -Inf, ymax = Inf, fill = "grey85", alpha = 0.5) +
+  geom_vline(xintercept = VPC_BENCHMARK_MEDIAN, linetype = "dashed",
+             linewidth = 0.4, colour = "grey35") +
+  {
+    if (all(is.na(metrics_table$vpc_model_a_low))) {
+      NULL
+    } else {
+      geom_errorbar(aes(xmin = vpc_model_a_low, xmax = vpc_model_a_high),
+                    orientation = "y", width = 0, linewidth = 0.4,
+                    colour = colour_predicted)
+    }
+  } +
+  geom_point(size = 2.6, colour = colour_predicted) +
+  labs(
+    title = "Between-stratum variation against published MAIHDA analyses",
+    subtitle = paste0(
+      "Shaded band: range of VPCs reported across published MAIHDA health ",
+      "analyses (", VPC_BENCHMARK_LOW, "% to ", VPC_BENCHMARK_HIGH,
+      "%).\nDashed line: their median (", VPC_BENCHMARK_MEDIAN,
+      "%). Bars are profile-likelihood 95% intervals where available."
+    ),
+    x = "Model A VPC (%)", y = NULL
+  ) + publication_theme
+
+save_plot_pair(p_vpc_benchmark,
+               file.path(OUTPUT_ROOT, "figures", "individual",
+                         "summary__vpc_benchmark"),
+               width = 11, height = 7)
 
 # --- Descriptive figures ----------------------------------------------------
 # Drawn here rather than in section 3B because the publication theme is defined
