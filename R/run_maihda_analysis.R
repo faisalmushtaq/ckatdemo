@@ -1,0 +1,3297 @@
+# =============================================================================
+# MAIHDA analysis of analysis_master
+# =============================================================================
+#
+# PURPOSE
+# -------
+# This script implements an Intersectional Multilevel Analysis of Individual
+# Heterogeneity and Discriminatory Accuracy (MAIHDA) for the binary outcomes in
+# analysis_master. It follows the model sequence and presentation logic in:
+#
+# Evans CR, Leckie G, Subramanian SV, Bell A, Merlo J. (2024).
+# A tutorial for conducting intersectional multilevel analysis of individual
+# heterogeneity and discriminatory accuracy (MAIHDA).
+# SSM - Population Health, 26, 101664.
+# https://doi.org/10.1016/j.ssmph.2024.101664
+#
+# INTERSECTIONAL STRATA
+# ---------------------
+# Strata are defined by five axes:
+#
+#   age_band x sex x ethnicity x imd_quintile x efi_category
+#
+# Opioid strength is deliberately excluded. It is a treatment characteristic
+# rather than a social position, and folding an exposure into the definition of
+# the groups whose inequality is being measured would confuse the two. If it is
+# ever wanted as an adjustment covariate rather than a stratum axis, that is a
+# different model and should be added explicitly.
+#
+# For each specification and outcome, two logistic MAIHDA models are fitted:
+#
+#   Model A: outcome ~ 1 + (1 | stratum)
+#            This null model quantifies the total between-stratum variation.
+#
+#   Model B: outcome ~ additive main effects + (1 | stratum)
+#            The remaining stratum random effects represent departures from
+#            the additive prediction. Within the MAIHDA framework these are
+#            interpreted as intersectional interaction residuals.
+#
+# Binary outcomes are collapsed to one binomial record per stratum before
+# fitting. This is the computationally efficient approach described in section
+# 2.5.C of the tutorial and retains the exact binomial likelihood.
+#
+# DESCRIPTIVE STATISTICS
+# ----------------------
+# Section 3B produces the descriptive material that should accompany any
+# MAIHDA result: cohort characteristics by axis, crude event rates by category
+# with Wilson intervals, a complete stratum-level listing including the strata
+# that will later be trimmed, and the stratum size distribution. These are
+# computed on the unfiltered cohort so that the analytic sample can always be
+# reconciled against the cohort it came from.
+#
+# MINIMUM CELL SIZE
+# -----------------
+# A five-way stratification produces a long tail of very small cells. Strata
+# below MIN_STRATUM_N individuals, or below MIN_STRATUM_EVENTS events, are
+# excluded before fitting. The default threshold is n >= 10, which is the
+# conventional statistical disclosure control floor for published cell-level
+# figures; see the extended note in section 1 for why the MAIHDA literature
+# itself does not require trimming. Every exclusion is accounted for: the
+# script reports how many strata, individuals and events were removed, what
+# share of the cohort was retained, and how the headline variance measures
+# respond to the threshold chosen. See section 5 and the stratum_retention
+# tables.
+#
+# The rule is applied AFTER the binomial collapse and BEFORE model fitting, so
+# the reported model quantities all refer to the retained analytic sample. The
+# unfiltered stratum size distribution is still reported, so the effect of the
+# rule is always visible.
+#
+# SINGULAR FITS
+# -------------
+# lme4 reports "boundary (singular) fit" when a random-intercept variance is
+# estimated at zero. For Model B this is frequently the correct substantive
+# answer rather than a numerical failure: it means the additive main effects
+# account for essentially all between-stratum variation and no residual
+# intersectional interaction remains. The script therefore suppresses lme4's
+# bare warning and instead:
+#
+#   * confirms the boundary by refitting with alternative optimisers, so a
+#     genuine zero variance is distinguished from an optimiser that stalled;
+#   * records the outcome in the model metrics and run log;
+#   * states the result explicitly on the affected figure panels.
+#
+# A singular Model A, by contrast, is always flagged as a data problem, because
+# it implies no detectable between-stratum variation at all.
+#
+# OUTPUTS
+# -------
+# The script writes model objects, CSV tables, APA-formatted Word tables,
+# individual figures, combined multi-panel figures and cross-outcome summary
+# figures beneath OUTPUT_ROOT. An OUTPUT_MANIFEST.csv lists every file written.
+# Nothing in analysis_master is overwritten.
+#
+# REQUIRED PACKAGES
+# -----------------
+# Required: lme4, dplyr, tidyr, ggplot2, patchwork, scales, ggrepel, officer,
+# flextable.
+# Optional: ggprism (typography; a matched fallback theme is used when it is
+# unavailable), svglite (vector output; PNG is always written).
+#
+# RUNNING THE SCRIPT
+# ------------------
+# The simplest use is:
+#
+#   Rscript run_maihda_analysis.R
+#
+# By default, the script searches common locations for analysis_master.rds and
+# simulated_analysis_master.rds. A path can be supplied explicitly:
+#
+#   MAIHDA_DATA_PATH=/full/path/analysis_master.rds \
+#     Rscript run_maihda_analysis.R
+#
+# A smaller validation run, using the 365-day any-event outcome while retaining
+# both stratum specifications, can be requested with:
+#
+#   MAIHDA_TEST_MODE=1 Rscript run_maihda_analysis.R
+#
+# All tunable settings are environment variables; see section 1.
+# =============================================================================
+
+options(stringsAsFactors = FALSE, warn = 1)
+set.seed(20260814)
+
+RUN_STARTED_AT <- Sys.time()
+
+# =============================================================================
+# 1. USER-EDITABLE SETTINGS
+# =============================================================================
+
+# Small helpers so every setting can be supplied from the environment without
+# editing the file. This matters on a computing cluster, where the script is
+# usually read-only and parameters arrive through the job submission.
+env_flag <- function(name, default = FALSE) {
+  raw <- tolower(Sys.getenv(name, unset = if (default) "1" else "0"))
+  raw %in% c("1", "true", "yes", "y", "on")
+}
+env_number <- function(name, default) {
+  raw <- Sys.getenv(name, unset = "")
+  if (!nzchar(raw)) return(default)
+  parsed <- suppressWarnings(as.numeric(raw))
+  if (is.na(parsed)) {
+    stop("Environment variable ", name, " must be numeric, received: ", raw)
+  }
+  parsed
+}
+
+# Leave DATA_PATH empty to use the automatic file search below. An environment
+# variable is convenient when running from Terminal or a computing cluster.
+DATA_PATH <- Sys.getenv("MAIHDA_DATA_PATH", unset = "")
+
+# All result files are placed here. A relative path is interpreted from the
+# directory in which R is started.
+OUTPUT_ROOT <- Sys.getenv("MAIHDA_OUTPUT_ROOT", unset = "maihda_outputs")
+
+# The tutorial uses Laplace maximum-likelihood estimation. nAGQ = 1 requests
+# the standard Laplace approximation in glmer. Setting it to 0 is faster but is
+# a less accurate approximation and is therefore avoided for the main run.
+N_AGQ <- as.integer(env_number("MAIHDA_NAGQ", 1))
+
+# Set through MAIHDA_TEST_MODE=1 for a one-outcome validation run.
+TEST_MODE <- env_flag("MAIHDA_TEST_MODE")
+
+# --- Minimum cell size ------------------------------------------------------
+# Strata smaller than MIN_STRATUM_N, or with fewer than MIN_STRATUM_EVENTS
+# events, are excluded before fitting.
+#
+# On what the best practice actually is, because the two relevant literatures
+# pull in opposite directions and it is worth being explicit about the choice:
+#
+#   * The MAIHDA methodological literature does NOT recommend trimming. Partial
+#     pooling is the whole point of the approach: a stratum of four people
+#     contributes very little to its own estimate and is shrunk towards the
+#     additive prediction, so it does no harm. Simulation work on MAIHDA
+#     (Bell, Holman and Jones) finds the variance estimates hold up well even
+#     with many small strata. On purely statistical grounds the defensible
+#     answer is to keep everything.
+#
+#   * Statistical disclosure control in UK health data does require a floor.
+#     A threshold of 10 is the conventional minimum for anything that will be
+#     published at cell level, and this analysis writes stratum-level tables
+#     and names individual strata on its figures.
+#
+# The default of 10 is therefore chosen to satisfy disclosure control at the
+# lowest threshold that does so, rather than to improve the model. It is the
+# defensible middle: a stricter floor such as 30 discards a large share of a
+# five-way grid for no statistical gain. The sensitivity sweep in section 9
+# refits the models across a range of thresholds so the choice can be shown to
+# be immaterial to the conclusions rather than merely asserted to be.
+#
+# MIN_STRATUM_EVENTS defaults to 0, meaning zero-event strata are RETAINED.
+# This is intentional. A stratum with 40 people and no events is a genuine
+# observation of low risk, and partial pooling handles it correctly. Requiring
+# at least one event would systematically discard the low-risk end of the
+# distribution and bias the predicted-risk range upwards. Raise it only if
+# disclosure control requires it.
+MIN_STRATUM_N <- as.integer(env_number("MAIHDA_MIN_STRATUM_N", 10))
+MIN_STRATUM_EVENTS <- as.integer(env_number("MAIHDA_MIN_STRATUM_EVENTS", 0))
+
+# An analysis is abandoned, rather than fitted on an uninformative remnant, if
+# fewer than this many strata survive the rule.
+MIN_RETAINED_STRATA <- as.integer(env_number("MAIHDA_MIN_RETAINED_STRATA", 20))
+
+# A threshold sweep is run for one outcome so that the choice above can be
+# justified rather than asserted. It refits Models A and B at each candidate
+# threshold and reports how the variance measures respond.
+RUN_THRESHOLD_SENSITIVITY <- env_flag("MAIHDA_THRESHOLD_SENSITIVITY",
+                                      default = TRUE)
+SENSITIVITY_THRESHOLDS <- c(0, 5, 10, 20, 30, 50)
+
+# --- Numerical and output settings ------------------------------------------
+# Tolerance used consistently for every singularity test, so that the metrics
+# table, the log and the figure captions cannot disagree with one another.
+SINGULAR_TOLERANCE <- 1e-5
+
+# Multiplicity control for the stratum interaction residuals. Twelve outcomes
+# times two specifications times several hundred strata generates a great many
+# simultaneous comparisons, and the uncorrected flag alone will produce false
+# positives at a predictable rate. Both flags are reported.
+FDR_LEVEL <- env_number("MAIHDA_FDR_LEVEL", 0.05)
+
+# Vector output is useful for journal submission but doubles the figure writing
+# time and needs the svglite package. It degrades to PNG-only automatically.
+WRITE_SVG <- env_flag("MAIHDA_WRITE_SVG", default = TRUE)
+
+# Fitted glmer objects retain their model frames and are large. They are worth
+# keeping for a definitive run and not worth keeping while iterating.
+SAVE_MODELS <- env_flag("MAIHDA_SAVE_MODELS", default = TRUE)
+
+# Skip an analysis whose metrics file already exists. Useful when a long run is
+# interrupted, and harmless otherwise.
+RESUME <- env_flag("MAIHDA_RESUME")
+
+# Number of extreme strata retained at each end of the predicted-risk ranking.
+N_EXTREME <- as.integer(env_number("MAIHDA_N_EXTREME", 6))
+
+# Number of strata labelled at each end of the dense caterpillar and
+# interaction panels. The significant-only interaction panel names every
+# retained stratum on its y-axis, so this limit does not apply there.
+N_PLOT_LABEL <- as.integer(env_number("MAIHDA_N_PLOT_LABEL", 1))
+
+# Figure dimensions and resolution.
+FIGURE_WIDTH <- env_number("MAIHDA_FIGURE_WIDTH", 9)
+FIGURE_HEIGHT <- env_number("MAIHDA_FIGURE_HEIGHT", 6.5)
+FIGURE_DPI <- env_number("MAIHDA_FIGURE_DPI", 320)
+
+# Size of the stratum condition labels. These name the actual intersectional
+# combinations and are the part of the figure a reader most needs to be able to
+# read, so they are set well above the ggplot2 annotation default and are
+# exposed here rather than buried in each geom.
+#
+# LABEL_SIZE_CALLOUT applies to the repelled callouts on the dense caterpillar
+# and interaction panels; LABEL_SIZE_AXIS applies to the named y-axis of the
+# significant-interaction forest panel. Sizes are in millimetres, ggplot2's
+# convention for text geoms, where 1 mm is roughly 2.85 points.
+LABEL_SIZE_CALLOUT <- env_number("MAIHDA_LABEL_SIZE_CALLOUT", 3.4)
+LABEL_SIZE_AXIS <- env_number("MAIHDA_LABEL_SIZE_AXIS", 9.5)
+
+# Preferred typeface, in order. The first family actually present on the system
+# is used; if none are found the device default is used rather than allowing
+# ggplot2 to emit a font warning for every single panel.
+PREFERRED_FONTS <- c("Arial", "Helvetica", "Liberation Sans", "DejaVu Sans")
+
+# All binary outcomes supported by analysis_master. Composite outcomes are
+# included alongside their individual components because they answer distinct
+# substantive questions.
+OUTCOME_LABELS <- c(
+  event_90d_any = "Any event, 90 days",
+  event_365d_any = "Any event, 365 days",
+  event_90d_nonfatal = "Non-fatal event, 90 days",
+  event_365d_nonfatal = "Non-fatal event, 365 days",
+  event_90d_fall = "Fall, 90 days",
+  event_365d_fall = "Fall, 365 days",
+  event_90d_fracture = "Fracture, 90 days",
+  event_365d_fracture = "Fracture, 365 days",
+  event_90d_delirium = "Delirium, 90 days",
+  event_365d_delirium = "Delirium, 365 days",
+  event_90d_death = "Death, 90 days",
+  event_365d_death = "Death, 365 days"
+)
+
+if (TEST_MODE) {
+  OUTCOME_LABELS <- OUTCOME_LABELS["event_365d_any"]
+}
+
+# Compact but fully interpretable axis names for plots and tables. Axis names
+# are retained alongside their values because a string such as
+# "85+ | Female | Q5" is much easier to misread when several variables have
+# overlapping category labels. Defined here, with the other settings, because
+# the descriptive tables need them before any figure code is reached.
+axis_display_names <- c(
+  age_band = "Age", age_3cat = "Age", sex = "Sex",
+  ethnicity = "Ethnicity", ethnicity_4cat = "Ethnicity",
+  imd_quintile = "IMD", imd_3cat = "IMD",
+  opioid_strength = "Opioid", efi_category = "Frailty",
+  efi_category_3 = "Frailty"
+)
+display_name_for <- function(axis) {
+  known <- unname(axis_display_names[axis])
+  ifelse(is.na(known), axis, known)
+}
+
+# The outcome used for the minimum-cell threshold sweep.
+SENSITIVITY_OUTCOME <- Sys.getenv(
+  "MAIHDA_SENSITIVITY_OUTCOME", unset = names(OUTCOME_LABELS)[1L]
+)
+
+# The variable names and their intended reference categories are defined once
+# here so that the model specification, output labels and stratum identifiers
+# remain consistent throughout the script.
+#
+# The intersectional strata are defined by five social and clinical axes: age,
+# sex, ethnicity, deprivation and frailty. Opioid strength is deliberately NOT
+# a stratum axis. It is a treatment characteristic rather than a social
+# position, and including it would mix an exposure into the definition of the
+# groups whose inequality is being measured.
+#
+# The structure remains a named list so that further specifications can be
+# added without touching any other part of the script; every loop, table and
+# figure iterates over whatever is defined here.
+SPECIFICATIONS <- list(
+  main = list(
+    label = "Intersectional strata",
+    axes = c("age_band", "sex", "ethnicity", "imd_quintile", "efi_category"),
+    references = c(
+      age_band = "65-69",
+      sex = "Male",
+      ethnicity = "White",
+      imd_quintile = "1 (Least deprived)",
+      efi_category = "Fit"
+    )
+  )
+)
+
+# =============================================================================
+# 2. PACKAGE AND FILE SET-UP
+# =============================================================================
+
+required_packages <- c(
+  "lme4", "dplyr", "tidyr", "ggplot2", "patchwork", "scales",
+  "ggrepel", "officer", "flextable"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following packages before running this script: ",
+    paste(missing_packages, collapse = ", "),
+    "\nRun: install.packages(c(",
+    paste(sprintf("\"%s\"", missing_packages), collapse = ", "),
+    "))"
+  )
+}
+
+# Optional packages are detected rather than required, so that the absence of a
+# purely cosmetic dependency cannot stop an analysis run.
+HAS_GGPRISM <- requireNamespace("ggprism", quietly = TRUE)
+HAS_SVGLITE <- requireNamespace("svglite", quietly = TRUE)
+HAS_SYSTEMFONTS <- requireNamespace("systemfonts", quietly = TRUE)
+if (WRITE_SVG && !HAS_SVGLITE) WRITE_SVG <- FALSE
+
+suppressPackageStartupMessages({
+  library(lme4)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(ggrepel)
+  library(officer)
+  library(flextable)
+})
+
+# Determine the script location so that automatic input discovery also works
+# when this file is launched from RStudio or from a different working directory.
+command_arguments <- commandArgs(trailingOnly = FALSE)
+file_argument <- grep("^--file=", command_arguments, value = TRUE)
+script_path <- if (length(file_argument) == 1L) {
+  normalizePath(sub("^--file=", "", file_argument), mustWork = FALSE)
+} else {
+  normalizePath(getwd(), mustWork = FALSE)
+}
+script_directory <- if (length(file_argument) == 1L) {
+  dirname(script_path)
+} else {
+  getwd()
+}
+project_directory <- normalizePath(file.path(script_directory, ".."),
+                                   mustWork = FALSE)
+
+find_data_file <- function(explicit_path = "") {
+  if (nzchar(explicit_path) && !file.exists(explicit_path)) {
+    stop("MAIHDA_DATA_PATH was set to a file that does not exist: ",
+         explicit_path)
+  }
+  search_directories <- unique(c(
+    getwd(), script_directory, project_directory,
+    file.path(project_directory, "outputs"),
+    file.path(project_directory, "data"),
+    file.path(project_directory, "work"),
+    file.path(project_directory, "work", "regeneration_check")
+  ))
+  candidates <- unique(c(
+    explicit_path,
+    as.vector(t(outer(
+      search_directories,
+      c("analysis_master.rds", "simulated_analysis_master.rds"),
+      file.path
+    )))
+  ))
+  candidates <- candidates[nzchar(candidates)]
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0L) {
+    stop(
+      "Could not find analysis_master.rds. Searched:\n  ",
+      paste(candidates, collapse = "\n  "),
+      "\nSet MAIHDA_DATA_PATH=/full/path/analysis_master.rds to be explicit."
+    )
+  }
+  normalizePath(existing[1L])
+}
+
+DATA_PATH <- find_data_file(DATA_PATH)
+OUTPUT_ROOT <- normalizePath(OUTPUT_ROOT, mustWork = FALSE)
+
+directories <- c(
+  OUTPUT_ROOT,
+  file.path(OUTPUT_ROOT, "tables"),
+  file.path(OUTPUT_ROOT, "tables", "word"),
+  file.path(OUTPUT_ROOT, "tables", "per_analysis"),
+  file.path(OUTPUT_ROOT, "figures"),
+  file.path(OUTPUT_ROOT, "figures", "individual"),
+  file.path(OUTPUT_ROOT, "figures", "multipanel"),
+  file.path(OUTPUT_ROOT, "models"),
+  file.path(OUTPUT_ROOT, "logs")
+)
+for (directory in directories) {
+  dir.create(directory, recursive = TRUE, showWarnings = FALSE)
+}
+if (!dir.exists(OUTPUT_ROOT)) {
+  stop("Could not create the output directory: ", OUTPUT_ROOT)
+}
+# A write test now is far preferable to discovering a permissions problem after
+# an hour of model fitting.
+write_probe <- file.path(OUTPUT_ROOT, ".write_probe")
+probe_status <- try(
+  {
+    writeLines("ok", write_probe)
+    unlink(write_probe)
+  },
+  silent = TRUE
+)
+if (inherits(probe_status, "try-error")) {
+  stop("The output directory is not writable: ", OUTPUT_ROOT)
+}
+
+# --- Logging ----------------------------------------------------------------
+# Everything reported to the console is also written to a durable log, because
+# the console output of an unattended cluster job is routinely lost.
+LOG_PATH <- file.path(OUTPUT_ROOT, "logs", "run_log.txt")
+cat("", file = LOG_PATH)
+
+log_message <- function(..., level = "INFO") {
+  line <- paste0(
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S", tz = "UTC"), " UTC  ",
+    formatC(level, width = -5), " ", paste0(..., collapse = "")
+  )
+  message(line)
+  cat(line, "\n", file = LOG_PATH, sep = "", append = TRUE)
+  invisible(line)
+}
+
+# Every file the script produces is recorded, so the run can be audited and so
+# an incomplete run is immediately obvious.
+output_registry <- new.env(parent = emptyenv())
+output_registry$paths <- character(0)
+register_output <- function(path) {
+  output_registry$paths <- c(output_registry$paths, path)
+  invisible(path)
+}
+write_csv_output <- function(data, path) {
+  write.csv(data, path, row.names = FALSE, na = "")
+  register_output(path)
+}
+
+log_message("MAIHDA analysis starting.")
+log_message("Input file      : ", DATA_PATH)
+log_message("Output directory: ", OUTPUT_ROOT)
+log_message("Outcomes        : ", length(OUTCOME_LABELS),
+            if (TEST_MODE) " (test mode)" else "")
+log_message("Minimum cell    : n >= ", MIN_STRATUM_N,
+            ", events >= ", MIN_STRATUM_EVENTS)
+if (!HAS_GGPRISM) {
+  log_message("ggprism is not installed; using the matched fallback theme.",
+              level = "NOTE")
+}
+if (!WRITE_SVG) {
+  log_message("SVG output disabled (svglite unavailable or turned off).",
+              level = "NOTE")
+}
+
+log_message("Loading data ...")
+analysis_master <- readRDS(DATA_PATH)
+
+if (!is.data.frame(analysis_master)) {
+  stop("The RDS object must be a data.frame or tibble, received: ",
+       paste(class(analysis_master), collapse = "/"))
+}
+if (nrow(analysis_master) == 0L) {
+  stop("The input data contains no rows.")
+}
+# tibbles and data.tables both subset differently from data.frame in ways that
+# would silently change behaviour further down. Normalising once removes the
+# whole class of problem.
+analysis_master <- as.data.frame(analysis_master)
+
+# =============================================================================
+# 3. INPUT VALIDATION AND AUDIT TABLES
+# =============================================================================
+
+all_axes <- unique(unname(unlist(lapply(SPECIFICATIONS, `[[`, "axes"))))
+all_required_variables <- unique(c(all_axes, names(OUTCOME_LABELS)))
+missing_variables <- setdiff(all_required_variables, names(analysis_master))
+if (length(missing_variables) > 0L) {
+  stop("Required variables are absent from the input data: ",
+       paste(missing_variables, collapse = ", "))
+}
+
+# Binary outcomes must resolve to 0, 1 or NA. Logical columns and factor or
+# character columns holding "0"/"1" are accepted and coerced, because both
+# appear routinely in derived datasets; anything else is a genuine error and is
+# caught here rather than halfway through model fitting.
+coerce_binary_outcome <- function(x, outcome) {
+  if (is.logical(x)) return(as.integer(x))
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    trimmed <- trimws(x)
+    recognised <- trimmed %in% c("0", "1") | is.na(trimmed)
+    if (!all(recognised)) {
+      stop(outcome, " is a character or factor column containing values other ",
+           "than 0/1: ",
+           paste(utils::head(setdiff(unique(trimmed), c("0", "1", NA)), 5),
+                 collapse = ", "))
+    }
+    return(as.integer(trimmed))
+  }
+  if (!is.numeric(x)) {
+    stop(outcome, " has an unsupported type: ", paste(class(x), collapse = "/"))
+  }
+  observed <- unique(x[!is.na(x)])
+  if (!all(observed %in% c(0, 1))) {
+    stop(outcome, " is not coded as a binary 0/1 variable. Observed values: ",
+         paste(utils::head(sort(observed), 8), collapse = ", "))
+  }
+  as.integer(x)
+}
+
+for (outcome in names(OUTCOME_LABELS)) {
+  analysis_master[[outcome]] <- coerce_binary_outcome(
+    analysis_master[[outcome]], outcome
+  )
+  complete_values <- analysis_master[[outcome]][!is.na(analysis_master[[outcome]])]
+  if (length(complete_values) == 0L) {
+    stop(outcome, " is missing for every record.")
+  }
+  # A constant outcome cannot support a random-intercept logistic model, and
+  # the failure mode is an obscure lme4 error rather than a clear one.
+  if (length(unique(complete_values)) < 2L) {
+    stop(outcome, " is constant (all ", unique(complete_values),
+         "); a MAIHDA model cannot be fitted to it.")
+  }
+}
+
+# Axis variables must be usable as categorical predictors. A continuous
+# variable reaching this point is nearly always a data-linkage mistake, and
+# stratifying on it would silently create one stratum per distinct value.
+for (axis in all_axes) {
+  distinct_n <- length(unique(analysis_master[[axis]][!is.na(analysis_master[[axis]])]))
+  if (distinct_n < 2L) {
+    stop("Axis ", axis, " has fewer than two observed categories.")
+  }
+  if (distinct_n > 50L) {
+    stop("Axis ", axis, " has ", distinct_n, " distinct values, which is too ",
+         "many for an intersectional stratum. Check that it is categorical.")
+  }
+}
+
+input_audit <- data.frame(
+  item = c("input_file", "rows", "columns", "test_mode", "n_outcomes",
+           "min_stratum_n", "min_stratum_events", "n_agq", "fdr_level",
+           "r_version", "lme4_version", "analysis_timestamp_utc"),
+  value = c(DATA_PATH, nrow(analysis_master), ncol(analysis_master),
+            TEST_MODE, length(OUTCOME_LABELS), MIN_STRATUM_N,
+            MIN_STRATUM_EVENTS, N_AGQ, FDR_LEVEL,
+            R.version.string,
+            as.character(utils::packageVersion("lme4")),
+            format(Sys.time(), tz = "UTC"))
+)
+write_csv_output(input_audit, file.path(OUTPUT_ROOT, "tables",
+                                        "input_audit.csv"))
+
+variable_audit <- data.frame(
+  variable = all_required_variables,
+  class = vapply(analysis_master[all_required_variables],
+                 function(x) class(x)[1L], character(1)),
+  missing_n = vapply(analysis_master[all_required_variables],
+                     function(x) sum(is.na(x)), numeric(1)),
+  missing_percent = vapply(analysis_master[all_required_variables],
+                           function(x) 100 * mean(is.na(x)), numeric(1)),
+  distinct_n = vapply(analysis_master[all_required_variables],
+                      function(x) length(unique(x[!is.na(x)])), numeric(1)),
+  row.names = NULL
+)
+write_csv_output(variable_audit,
+                 file.path(OUTPUT_ROOT, "tables", "variable_audit.csv"))
+
+# A full category listing removes any ambiguity about which level was used as
+# the reference and how each level is spelled in the source data.
+category_audit <- bind_rows(lapply(all_axes, function(axis) {
+  values <- analysis_master[[axis]]
+  counts <- sort(table(values, useNA = "no"), decreasing = TRUE)
+  reference_for <- vapply(SPECIFICATIONS, function(specification) {
+    if (axis %in% specification$axes) {
+      unname(specification$references[axis])
+    } else {
+      NA_character_
+    }
+  }, character(1))
+  reference_level <- unique(reference_for[!is.na(reference_for)])
+  data.frame(
+    variable = axis,
+    level = names(counts),
+    n = as.numeric(counts),
+    percent = 100 * as.numeric(counts) / sum(counts),
+    is_reference = names(counts) %in% reference_level
+  )
+}))
+write_csv_output(category_audit,
+                 file.path(OUTPUT_ROOT, "tables", "category_audit.csv"))
+
+outcome_counts <- bind_rows(lapply(names(OUTCOME_LABELS), function(outcome) {
+  values <- analysis_master[[outcome]]
+  complete <- !is.na(values)
+  data.frame(
+    outcome = outcome,
+    outcome_label = unname(OUTCOME_LABELS[outcome]),
+    total_n = length(values),
+    complete_n = sum(complete),
+    missing_n = sum(!complete),
+    event_n = sum(values[complete] == 1),
+    non_event_n = sum(values[complete] == 0),
+    event_percent = 100 * mean(values[complete] == 1)
+  )
+}))
+write_csv_output(outcome_counts,
+                 file.path(OUTPUT_ROOT, "tables", "outcome_counts.csv"))
+
+log_message("Validation passed: ", nrow(analysis_master), " rows, ",
+            length(OUTCOME_LABELS), " outcomes, ",
+            length(SPECIFICATIONS), " specifications.")
+
+# =============================================================================
+# 3B. DESCRIPTIVE STATISTICS
+# =============================================================================
+# The MAIHDA results are only interpretable against a clear description of the
+# cohort they came from. This section produces the conventional descriptive
+# material a reader or reviewer will expect before any modelling:
+#
+#   1. Cohort characteristics, one row per category of each stratum axis.
+#   2. Crude event rates by category, with Wilson confidence intervals, for
+#      every outcome and every axis category.
+#   3. A complete stratum-level descriptive table, including the strata that
+#      the minimum cell size rule will later remove, so nothing disappears
+#      without being counted somewhere.
+#   4. The stratum size distribution, which is the single most useful summary
+#      of how sparse a given intersectional grid is.
+#
+# These are all computed on the unfiltered cohort. Post-filter descriptions are
+# produced separately in the retention tables, so the two are never confused.
+
+# The Wilson score interval is used in preference to the Wald interval because
+# many categories here are small or have low event counts, exactly the
+# situation in which the Wald interval misbehaves and can run outside [0, 1].
+wilson_interval <- function(events, n, level = 0.95) {
+  z <- qnorm(1 - (1 - level) / 2)
+  proportion <- ifelse(n > 0, events / n, NA_real_)
+  denominator <- 1 + z^2 / n
+  centre <- (proportion + z^2 / (2 * n)) / denominator
+  half_width <- z * sqrt(proportion * (1 - proportion) / n +
+                           z^2 / (4 * n^2)) / denominator
+  list(
+    low = ifelse(n > 0, pmax(0, centre - half_width), NA_real_),
+    high = ifelse(n > 0, pmin(1, centre + half_width), NA_real_)
+  )
+}
+
+descriptive_axes <- SPECIFICATIONS[[1L]]$axes
+descriptive_references <- SPECIFICATIONS[[1L]]$references
+
+# --- 1. Cohort characteristics ----------------------------------------------
+cohort_characteristics <- bind_rows(lapply(descriptive_axes, function(axis) {
+  values <- analysis_master[[axis]]
+  complete <- !is.na(values)
+  counts <- table(values[complete])
+  # Levels are reported in their natural factor order where one exists, so the
+  # table reads in a sensible sequence rather than alphabetically.
+  level_order <- if (is.factor(values)) levels(droplevels(values[complete])) else
+    names(counts)
+  data.frame(
+    variable = axis,
+    variable_label = unname(axis_display_names[axis]),
+    level = level_order,
+    n = as.numeric(counts[level_order]),
+    percent = 100 * as.numeric(counts[level_order]) / sum(counts),
+    is_reference = level_order == unname(descriptive_references[axis]),
+    missing_n = sum(!complete),
+    missing_percent = 100 * mean(!complete)
+  )
+}))
+write_csv_output(cohort_characteristics,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "descriptive_cohort_characteristics.csv"))
+
+# --- 2. Crude event rates by category ---------------------------------------
+descriptive_event_rates <- bind_rows(lapply(names(OUTCOME_LABELS),
+                                            function(outcome) {
+  bind_rows(lapply(descriptive_axes, function(axis) {
+    frame <- data.frame(
+      level = analysis_master[[axis]],
+      outcome_value = analysis_master[[outcome]]
+    )
+    frame <- frame[!is.na(frame$level) & !is.na(frame$outcome_value), ]
+    summarised <- frame %>%
+      group_by(level) %>%
+      summarise(n = n(), events = sum(outcome_value == 1), .groups = "drop")
+    interval <- wilson_interval(summarised$events, summarised$n)
+    data.frame(
+      outcome = outcome,
+      outcome_label = unname(OUTCOME_LABELS[outcome]),
+      variable = axis,
+      variable_label = unname(axis_display_names[axis]),
+      level = as.character(summarised$level),
+      n = summarised$n,
+      events = summarised$events,
+      event_percent = 100 * summarised$events / summarised$n,
+      ci_low_percent = 100 * interval$low,
+      ci_high_percent = 100 * interval$high,
+      is_reference = as.character(summarised$level) ==
+        unname(descriptive_references[axis])
+    )
+  }))
+}))
+write_csv_output(descriptive_event_rates,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "descriptive_event_rates_by_category.csv"))
+
+# --- 3. Stratum-level description -------------------------------------------
+# Built once per specification on complete cases across the axes only. Outcome
+# specific counts are added for every outcome, and the flag showing whether the
+# stratum will survive the minimum cell size rule is attached here so that the
+# full grid and the analytic grid can always be reconciled.
+descriptive_strata <- bind_rows(lapply(names(SPECIFICATIONS),
+                                       function(specification_name) {
+  specification <- SPECIFICATIONS[[specification_name]]
+  axes <- specification$axes
+  complete <- complete.cases(analysis_master[, axes, drop = FALSE])
+  axis_data <- droplevels(analysis_master[complete, axes, drop = FALSE])
+  axis_data$stratum <- interaction(axis_data[, axes, drop = FALSE],
+                                   drop = TRUE, sep = " | ")
+
+  base <- axis_data %>%
+    group_by(across(all_of(c(axes, "stratum")))) %>%
+    summarise(n = n(), .groups = "drop")
+
+  outcome_columns <- lapply(names(OUTCOME_LABELS), function(outcome) {
+    values <- analysis_master[[outcome]][complete]
+    aggregated <- tapply(values, axis_data$stratum,
+                         function(x) sum(x == 1, na.rm = TRUE))
+    aggregated[match(as.character(base$stratum), names(aggregated))]
+  })
+  names(outcome_columns) <- paste0("events__", names(OUTCOME_LABELS))
+
+  bind_cols(
+    data.frame(
+      specification = specification_name,
+      specification_label = specification$label
+    ),
+    base,
+    as.data.frame(outcome_columns)
+  ) %>%
+    mutate(
+      percent_of_cohort = 100 * n / sum(n),
+      meets_minimum_cell = n >= MIN_STRATUM_N
+    ) %>%
+    arrange(desc(n))
+}))
+write_csv_output(descriptive_strata,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "descriptive_strata.csv"))
+
+# --- 4. Stratum size distribution -------------------------------------------
+descriptive_stratum_distribution <- descriptive_strata %>%
+  group_by(specification, specification_label) %>%
+  summarise(
+    observed_strata = n(),
+    possible_strata = prod(vapply(
+      SPECIFICATIONS[[specification[1L]]]$axes,
+      function(axis) length(unique(analysis_master[[axis]][
+        !is.na(analysis_master[[axis]])
+      ])),
+      numeric(1)
+    )),
+    individuals = sum(n),
+    minimum_n = min(n),
+    q1_n = unname(quantile(n, 0.25)),
+    median_n = median(n),
+    mean_n = mean(n),
+    q3_n = unname(quantile(n, 0.75)),
+    maximum_n = max(n),
+    strata_below_10 = sum(n < 10),
+    strata_10_to_29 = sum(n >= 10 & n < 30),
+    strata_30_to_99 = sum(n >= 30 & n < 100),
+    strata_100_plus = sum(n >= 100),
+    individuals_in_strata_below_minimum = sum(n[n < MIN_STRATUM_N]),
+    percent_individuals_below_minimum =
+      100 * sum(n[n < MIN_STRATUM_N]) / sum(n),
+    .groups = "drop"
+  ) %>%
+  mutate(empty_strata = possible_strata - observed_strata)
+write_csv_output(descriptive_stratum_distribution,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "descriptive_stratum_distribution.csv"))
+
+for (row_index in seq_len(nrow(descriptive_stratum_distribution))) {
+  row <- descriptive_stratum_distribution[row_index, ]
+  log_message("Descriptives (", row$specification_label, "): ",
+              row$observed_strata, " of ", row$possible_strata,
+              " possible strata observed; median n = ", row$median_n,
+              "; ", formatC(row$percent_individuals_below_minimum,
+                            format = "f", digits = 1),
+              "% of individuals sit in strata below n = ", MIN_STRATUM_N, ".")
+}
+
+# =============================================================================
+# 4. REUSABLE STATISTICAL FUNCTIONS
+# =============================================================================
+
+inv_logit <- plogis
+
+# Weighted AUC for collapsed binomial data. Each row represents `events`
+# positive observations and `non_events` negative observations at one score.
+# Scores are first grouped so ties receive the standard half-credit exactly.
+weighted_auc <- function(events, non_events, score) {
+  keep <- is.finite(score) & !is.na(events) & !is.na(non_events)
+  if (!any(keep)) return(NA_real_)
+  auc_data <- data.frame(
+    score = score[keep],
+    events = as.numeric(events[keep]),
+    non_events = as.numeric(non_events[keep])
+  ) %>%
+    group_by(score) %>%
+    summarise(
+      events = sum(events),
+      non_events = sum(non_events),
+      .groups = "drop"
+    ) %>%
+    arrange(score)
+
+  # Totals are held in double precision throughout. With a cohort of this size
+  # the number of possible case-control pairs can exceed R's 32-bit integer
+  # limit even though the resulting AUC remains well behaved.
+  total_events <- sum(auc_data$events)
+  total_non_events <- sum(auc_data$non_events)
+  if (total_events == 0 || total_non_events == 0) return(NA_real_)
+
+  non_events_below <- c(0, head(cumsum(auc_data$non_events), -1L))
+  concordant_pairs <- sum(
+    auc_data$events * (non_events_below + 0.5 * auc_data$non_events)
+  )
+  concordant_pairs / (total_events * total_non_events)
+}
+
+# Extract the random-intercept variance. A variance can legitimately be zero in
+# Model B if additive effects explain all between-stratum variation. The result
+# is kept rather than replaced with an arbitrary positive value.
+random_intercept_variance <- function(model) {
+  variance_table <- as.data.frame(VarCorr(model))
+  matched <- variance_table$vcov[variance_table$grp == "stratum"]
+  if (length(matched) == 0L) return(NA_real_)
+  matched[1L]
+}
+
+# Latent-response VPC for logistic models. The individual-level variance is
+# fixed to pi^2/3, the variance of the standard logistic distribution.
+logistic_vpc <- function(variance) {
+  variance / (variance + (pi^2 / 3))
+}
+
+# Median odds ratio translates the random-intercept variance to the odds-ratio
+# scale. It is the median contrast between two otherwise identical individuals
+# drawn from higher- and lower-risk strata.
+median_odds_ratio <- function(variance) {
+  exp(qnorm(0.75) * sqrt(2 * variance))
+}
+
+extract_convergence_message <- function(model) {
+  messages <- model@optinfo$conv$lme4$messages
+  if (is.null(messages) || length(messages) == 0L) "OK" else
+    paste(messages, collapse = " | ")
+}
+
+# --- Robust model fitting ---------------------------------------------------
+# A single optimiser occasionally stalls on a flat likelihood and reports a
+# zero variance that a different optimiser would not. Because a zero variance
+# is a substantive conclusion in MAIHDA, it is worth the extra fits to
+# establish whether the boundary is genuine. The ladder is only walked when the
+# first fit is singular or raises a convergence warning, so a healthy run pays
+# nothing for it.
+OPTIMIZER_LADDER <- list(
+  list(name = "bobyqa",
+       control = list(optimizer = "bobyqa", optCtrl = list(maxfun = 200000))),
+  list(name = "Nelder_Mead",
+       control = list(optimizer = "Nelder_Mead",
+                      optCtrl = list(maxfun = 200000))),
+  list(name = "nlminbwrap",
+       control = list(optimizer = "nlminbwrap", optCtrl = list()))
+)
+
+build_control <- function(entry) {
+  glmerControl(
+    optimizer = entry$control$optimizer,
+    optCtrl = entry$control$optCtrl,
+    # lme4's own singularity warning is suppressed here so that the script can
+    # report the result with its interpretation attached instead of emitting a
+    # bare warning that reads like a failure. Singularity is still detected,
+    # recorded in the metrics and written to the log.
+    check.conv.singular = .makeCC(action = "ignore", tol = SINGULAR_TOLERANCE)
+  )
+}
+
+fit_glmer_robust <- function(model_formula, data, model_label) {
+  attempts <- list()
+  best <- NULL
+
+  for (index in seq_along(OPTIMIZER_LADDER)) {
+    entry <- OPTIMIZER_LADDER[[index]]
+    captured_warnings <- character(0)
+    fitted <- withCallingHandlers(
+      tryCatch(
+        glmer(model_formula, data = data, family = binomial(link = "logit"),
+              nAGQ = N_AGQ, control = build_control(entry)),
+        error = function(condition) condition
+      ),
+      warning = function(condition) {
+        captured_warnings <<- c(captured_warnings, conditionMessage(condition))
+        invokeRestart("muffleWarning")
+      }
+    )
+
+    if (inherits(fitted, "condition")) {
+      attempts[[length(attempts) + 1L]] <- data.frame(
+        optimizer = entry$name, status = "error",
+        log_likelihood = NA_real_, variance = NA_real_, singular = NA,
+        detail = conditionMessage(fitted)
+      )
+      next
+    }
+
+    singular <- isSingular(fitted, tol = SINGULAR_TOLERANCE)
+    attempts[[length(attempts) + 1L]] <- data.frame(
+      optimizer = entry$name, status = "fitted",
+      log_likelihood = as.numeric(logLik(fitted)),
+      variance = random_intercept_variance(fitted),
+      singular = singular,
+      detail = paste(c(extract_convergence_message(fitted), captured_warnings),
+                     collapse = " | ")
+    )
+
+    if (is.null(best) ||
+        as.numeric(logLik(fitted)) > as.numeric(logLik(best$model)) + 1e-8) {
+      best <- list(model = fitted, optimizer = entry$name, singular = singular,
+                   warnings = captured_warnings)
+    }
+
+    # A clean, non-singular fit needs no further work.
+    converged_cleanly <- !singular &&
+      length(captured_warnings) == 0L &&
+      identical(extract_convergence_message(fitted), "OK")
+    if (converged_cleanly) break
+  }
+
+  if (is.null(best)) {
+    stop("Model ", model_label, " could not be fitted with any optimiser: ",
+         paste(vapply(attempts, function(a) paste0(a$optimizer, ": ", a$detail),
+                      character(1)), collapse = " || "))
+  }
+
+  attempt_table <- bind_rows(attempts)
+  successful <- attempt_table[attempt_table$status == "fitted", , drop = FALSE]
+  # The boundary is treated as confirmed when every optimiser that produced a
+  # fit agreed on it. A disagreement is recorded so it can be inspected.
+  boundary_confirmed <- nrow(successful) > 0L && all(successful$singular)
+
+  list(
+    model = best$model,
+    optimizer = best$optimizer,
+    singular = best$singular,
+    boundary_confirmed = boundary_confirmed,
+    n_optimizers_tried = nrow(attempt_table),
+    attempts = attempt_table
+  )
+}
+
+# --- Fixed effects ----------------------------------------------------------
+# Model terms are decomposed into variable and level, and the omitted reference
+# categories are reinstated as explicit rows. A fixed-effects table that simply
+# drops the reference level forces the reader to reconstruct the comparison
+# being made, which is exactly the sort of avoidable friction that generates
+# reviewer queries.
+build_term_lookup <- function(strata, axes) {
+  rows <- lapply(axes, function(axis) {
+    levels_present <- levels(strata[[axis]])
+    data.frame(
+      term = paste0(axis, levels_present),
+      variable = axis,
+      variable_label = display_name_for(axis),
+      level = levels_present,
+      is_reference = seq_along(levels_present) == 1L
+    )
+  })
+  bind_rows(
+    data.frame(term = "(Intercept)", variable = "(Intercept)",
+               variable_label = "Intercept", level = "",
+               is_reference = FALSE),
+    bind_rows(rows)
+  )
+}
+
+extract_fixed_effects <- function(model, strata, axes, specification,
+                                  specification_label, outcome,
+                                  outcome_label) {
+  coefficient_table <- as.data.frame(coef(summary(model)))
+  coefficient_table$term <- rownames(coefficient_table)
+  rownames(coefficient_table) <- NULL
+  names(coefficient_table)[1:4] <- c("estimate_log_odds", "standard_error",
+                                     "z_value", "p_value")
+
+  lookup <- build_term_lookup(strata, axes)
+  estimated <- coefficient_table %>%
+    left_join(lookup, by = "term") %>%
+    mutate(
+      odds_ratio = exp(estimate_log_odds),
+      confidence_low = exp(estimate_log_odds - 1.96 * standard_error),
+      confidence_high = exp(estimate_log_odds + 1.96 * standard_error),
+      is_reference = ifelse(is.na(is_reference), FALSE, is_reference)
+    )
+
+  # Reference rows carry an odds ratio of exactly one by construction.
+  reference_rows <- lookup %>%
+    filter(is_reference, !term %in% estimated$term) %>%
+    mutate(
+      estimate_log_odds = 0, standard_error = NA_real_, z_value = NA_real_,
+      p_value = NA_real_, odds_ratio = 1, confidence_low = NA_real_,
+      confidence_high = NA_real_
+    )
+
+  bind_rows(estimated, reference_rows) %>%
+    mutate(
+      specification = specification,
+      specification_label = specification_label,
+      outcome = outcome,
+      outcome_label = outcome_label,
+      # Terms that lme4 dropped for rank deficiency have no estimate and are
+      # marked so, rather than appearing as a silent omission.
+      term_status = case_when(
+        is_reference ~ "reference",
+        is.na(standard_error) ~ "not estimated",
+        TRUE ~ "estimated"
+      ),
+      variable = ifelse(is.na(variable), term, variable),
+      variable_label = ifelse(is.na(variable_label), term, variable_label),
+      level = ifelse(is.na(level), "", level)
+    ) %>%
+    arrange(match(variable, c("(Intercept)", axes)), match(level, level)) %>%
+    select(specification, specification_label, outcome, outcome_label,
+           term, variable, variable_label, level, term_status, is_reference,
+           estimate_log_odds, standard_error, z_value, p_value,
+           odds_ratio, confidence_low, confidence_high)
+}
+
+# Convert a random-effect model into one row per stratum with additive-only and
+# additive-plus-interaction predictions. Confidence intervals are approximate,
+# matching the tutorial's warning that fixed and random-effect uncertainty are
+# combined under a zero-covariance assumption.
+make_stratum_predictions <- function(model_a, model_b, strata_data,
+                                     axes, specification, specification_label,
+                                     outcome, outcome_label) {
+  # `formula(..., fixed.only = TRUE)` returns the fixed part directly and also
+  # avoids relying on the former lme4::nobars location, which has moved to the
+  # reformulas package in recent lme4 releases.
+  fixed_formula_b <- formula(model_b, fixed.only = TRUE)
+  fixed_formula_a <- formula(model_a, fixed.only = TRUE)
+
+  matrix_b <- model.matrix(fixed_formula_b, data = strata_data)
+  matrix_a <- model.matrix(fixed_formula_a, data = strata_data)
+
+  beta_b <- fixef(model_b)
+  beta_a <- fixef(model_a)
+
+  # When lme4 drops rank-deficient columns, the coefficient vector is shorter
+  # than the model matrix. Aligning explicitly prevents a dimension mismatch
+  # that would otherwise surface as an opaque matrix multiplication error.
+  if (!all(names(beta_b) %in% colnames(matrix_b))) {
+    stop("Model B coefficients could not be aligned to the model matrix.")
+  }
+  matrix_b <- matrix_b[, names(beta_b), drop = FALSE]
+  matrix_a <- matrix_a[, names(beta_a), drop = FALSE]
+
+  fixed_eta_b <- as.numeric(matrix_b %*% beta_b)
+  fixed_eta_a <- as.numeric(matrix_a %*% beta_a)
+
+  covariance_b <- as.matrix(vcov(model_b))
+  fixed_se_b <- sqrt(pmax(0, rowSums((matrix_b %*% covariance_b) * matrix_b)))
+
+  # ranef() is computed once per model; the earlier version called it twice for
+  # Model B, which doubled the cost on the largest specifications.
+  ranef_b <- ranef(model_b, condVar = TRUE)$stratum
+  ranef_a <- ranef(model_a, condVar = TRUE)$stratum
+  posterior_variance_b <- attr(ranef_b, "postVar")
+
+  random_b <- data.frame(
+    level = rownames(ranef_b),
+    random_effect_b = ranef_b[[1L]],
+    random_se_b = sqrt(as.numeric(posterior_variance_b[1, 1, ]))
+  )
+  random_a <- data.frame(
+    level = rownames(ranef_a),
+    random_effect_a = ranef_a[[1L]]
+  )
+
+  aligned <- strata_data %>%
+    mutate(level = as.character(stratum)) %>%
+    left_join(random_b, by = "level") %>%
+    left_join(random_a, by = "level")
+
+  if (anyNA(aligned$random_effect_b) || anyNA(aligned$random_effect_a)) {
+    stop("Random effects could not be aligned to every stratum.")
+  }
+
+  total_eta_b <- fixed_eta_b + aligned$random_effect_b
+  total_se_b <- sqrt(fixed_se_b^2 + aligned$random_se_b^2)
+
+  prediction <- aligned %>%
+    mutate(
+      specification = specification,
+      specification_label = specification_label,
+      outcome = outcome,
+      outcome_label = outcome_label,
+      observed_probability = events / n,
+      null_fixed_probability = inv_logit(fixed_eta_a),
+      null_total_probability = inv_logit(fixed_eta_a + random_effect_a),
+      additive_probability = inv_logit(fixed_eta_b),
+      total_probability = inv_logit(total_eta_b),
+      total_probability_low = inv_logit(total_eta_b - 1.96 * total_se_b),
+      total_probability_high = inv_logit(total_eta_b + 1.96 * total_se_b),
+      interaction_log_odds = random_effect_b,
+      interaction_log_odds_se = random_se_b,
+      interaction_log_odds_low = random_effect_b - 1.96 * random_se_b,
+      interaction_log_odds_high = random_effect_b + 1.96 * random_se_b,
+      interaction_probability_difference =
+        total_probability - additive_probability,
+      interaction_probability_difference_low =
+        inv_logit(fixed_eta_b + interaction_log_odds_low) - additive_probability,
+      interaction_probability_difference_high =
+        inv_logit(fixed_eta_b + interaction_log_odds_high) - additive_probability,
+      # The z statistic treats the conditional mode and its conditional
+      # standard deviation as an approximate Wald quantity. This is the usual
+      # applied convention and is what the interval on the figures shows.
+      interaction_z = ifelse(random_se_b > 0, random_effect_b / random_se_b,
+                             NA_real_),
+      interaction_p_value = 2 * pnorm(-abs(interaction_z)),
+      interaction_distinguishable =
+        !is.na(interaction_log_odds_low) &
+        (interaction_log_odds_low > 0 | interaction_log_odds_high < 0),
+      prediction_rank = rank(total_probability, ties.method = "first"),
+      interaction_rank = rank(interaction_probability_difference,
+                              ties.method = "first")
+    )
+
+  # Benjamini-Hochberg control across the strata within this analysis. With
+  # several hundred simultaneous comparisons the uncorrected flag alone will
+  # identify strata by chance at a predictable rate, so both are carried
+  # forward and the corrected one is used for the headline count.
+  prediction$interaction_q_value <- if (all(is.na(prediction$interaction_p_value))) {
+    NA_real_
+  } else {
+    p.adjust(prediction$interaction_p_value, method = "BH")
+  }
+  prediction$interaction_distinguishable_fdr <-
+    !is.na(prediction$interaction_q_value) &
+    prediction$interaction_q_value < FDR_LEVEL
+
+  prediction %>%
+    select(
+      specification, specification_label, outcome, outcome_label,
+      all_of(axes), stratum, n, events, non_events,
+      observed_probability, null_fixed_probability, null_total_probability,
+      additive_probability, total_probability, total_probability_low,
+      total_probability_high, interaction_log_odds, interaction_log_odds_se,
+      interaction_log_odds_low, interaction_log_odds_high,
+      interaction_probability_difference,
+      interaction_probability_difference_low,
+      interaction_probability_difference_high,
+      interaction_z, interaction_p_value, interaction_q_value,
+      interaction_distinguishable, interaction_distinguishable_fdr,
+      prediction_rank, interaction_rank
+    )
+}
+
+# =============================================================================
+# 5. DATA PREPARATION AND THE MINIMUM CELL SIZE RULE
+# =============================================================================
+
+prepare_analysis_data <- function(data, axes, references, outcomes) {
+  prepared <- data[, c(axes, outcomes), drop = FALSE]
+
+  for (axis in axes) {
+    # factor() also strips any ordered-factor class. This matters: an ordered
+    # factor would otherwise be given polynomial contrasts by model.matrix,
+    # producing .L and .Q terms in place of the interpretable level contrasts
+    # the analysis is built around.
+    values <- prepared[[axis]]
+    if (is.ordered(values)) {
+      values <- factor(as.character(values), levels = levels(values))
+    }
+    prepared[[axis]] <- droplevels(factor(values))
+
+    reference <- unname(references[axis])
+    if (!reference %in% levels(prepared[[axis]])) {
+      stop("Reference level '", reference, "' is absent from ", axis,
+           ". Observed levels: ",
+           paste(levels(prepared[[axis]]), collapse = ", "))
+    }
+    prepared[[axis]] <- relevel(prepared[[axis]], ref = reference)
+  }
+  prepared
+}
+
+make_stratum_counts <- function(data, axes, outcome) {
+  complete <- complete.cases(data[, c(axes, outcome), drop = FALSE])
+  excluded <- sum(!complete)
+  model_data <- droplevels(data[complete, c(axes, outcome), drop = FALSE])
+
+  if (nrow(model_data) == 0L) {
+    stop("No complete records remain for ", outcome, ".")
+  }
+
+  # interaction() creates a stable factor identifier while retaining each axis
+  # separately for the additive main-effects model and output tables.
+  model_data$stratum <- interaction(
+    model_data[, axes, drop = FALSE], drop = TRUE, sep = " | "
+  )
+
+  strata <- model_data %>%
+    group_by(across(all_of(c(axes, "stratum")))) %>%
+    summarise(
+      n = n(),
+      events = sum(.data[[outcome]] == 1),
+      non_events = sum(.data[[outcome]] == 0),
+      .groups = "drop"
+    ) %>%
+    mutate(stratum = factor(stratum))
+
+  # An internal consistency check on the collapse. If this ever fails the
+  # binomial denominators are wrong and every downstream quantity is invalid.
+  if (!isTRUE(all.equal(strata$n, strata$events + strata$non_events))) {
+    stop("Stratum totals do not reconcile for ", outcome,
+         "; events plus non-events does not equal n.")
+    }
+
+  list(
+    data = strata,
+    included_n = nrow(model_data),
+    excluded_n = excluded,
+    observed_strata = nrow(strata),
+    possible_strata = prod(vapply(model_data[axes], nlevels, integer(1)))
+  )
+}
+
+# --- The minimum cell size rule ---------------------------------------------
+# Applied after the binomial collapse and before fitting. Everything removed is
+# counted, so the analytic sample can be reconciled against the full cohort at
+# any point.
+apply_minimum_cell_rule <- function(strata, axes, references,
+                                    min_n, min_events) {
+  retained_flag <- strata$n >= min_n & strata$events >= min_events
+  retained <- strata[retained_flag, , drop = FALSE]
+  excluded <- strata[!retained_flag, , drop = FALSE]
+
+  accounting <- data.frame(
+    min_stratum_n = min_n,
+    min_stratum_events = min_events,
+    strata_before = nrow(strata),
+    strata_retained = nrow(retained),
+    strata_excluded = nrow(excluded),
+    strata_retained_percent = if (nrow(strata) > 0) {
+      100 * nrow(retained) / nrow(strata)
+    } else NA_real_,
+    individuals_before = sum(strata$n),
+    individuals_retained = sum(retained$n),
+    individuals_excluded = sum(excluded$n),
+    individuals_retained_percent = if (sum(strata$n) > 0) {
+      100 * sum(retained$n) / sum(strata$n)
+    } else NA_real_,
+    events_before = sum(strata$events),
+    events_retained = sum(retained$events),
+    events_excluded = sum(excluded$events),
+    events_retained_percent = if (sum(strata$events) > 0) {
+      100 * sum(retained$events) / sum(strata$events)
+    } else NA_real_,
+    excluded_median_n = if (nrow(excluded) > 0) median(excluded$n) else NA_real_,
+    excluded_max_n = if (nrow(excluded) > 0) max(excluded$n) else NA_real_,
+    retained_zero_event_strata = sum(retained$events == 0),
+    retained_zero_non_event_strata = sum(retained$non_events == 0)
+  )
+
+  if (nrow(retained) == 0L) {
+    return(list(data = retained, excluded = excluded, accounting = accounting,
+                model_axes = character(0), reference_changes = data.frame(),
+                dropped_axes = axes))
+  }
+
+  # Trimming can remove an entire category of an axis. Two consequences have to
+  # be handled explicitly rather than left to surface as a modelling error.
+  retained <- droplevels(retained)
+  retained$stratum <- droplevels(factor(retained$stratum))
+
+  reference_changes <- list()
+  dropped_axes <- character(0)
+  model_axes <- character(0)
+
+  for (axis in axes) {
+    levels_present <- levels(retained[[axis]])
+
+    # An axis reduced to a single category carries no information once the
+    # intercept is in the model. It is kept for labelling but removed from the
+    # fixed-effects formula, where it would be aliased with the intercept.
+    if (length(levels_present) < 2L) {
+      dropped_axes <- c(dropped_axes, axis)
+      next
+    }
+    model_axes <- c(model_axes, axis)
+
+    intended_reference <- unname(references[axis])
+    if (!intended_reference %in% levels_present) {
+      # Falling back to the largest surviving category keeps the contrasts
+      # well determined. This is recorded prominently because it changes the
+      # interpretation of every odds ratio for that axis.
+      level_sizes <- tapply(retained$n, retained[[axis]], sum)
+      replacement <- names(which.max(level_sizes))
+      reference_changes[[length(reference_changes) + 1L]] <- data.frame(
+        variable = axis, intended_reference = intended_reference,
+        used_reference = replacement
+      )
+      retained[[axis]] <- relevel(retained[[axis]], ref = replacement)
+    } else {
+      retained[[axis]] <- relevel(retained[[axis]], ref = intended_reference)
+    }
+  }
+
+  list(
+    data = retained,
+    excluded = excluded,
+    accounting = accounting,
+    model_axes = model_axes,
+    reference_changes = bind_rows(reference_changes),
+    dropped_axes = dropped_axes
+  )
+}
+
+stratum_size_summary <- function(strata, specification, specification_label,
+                                 outcome, outcome_label,
+                                 included_n, excluded_n, possible_strata,
+                                 stage) {
+  sizes <- strata$n
+  if (length(sizes) == 0L) sizes <- NA_real_
+  data.frame(
+    specification = specification,
+    specification_label = specification_label,
+    outcome = outcome,
+    outcome_label = outcome_label,
+    stage = stage,
+    included_n = included_n,
+    excluded_n = excluded_n,
+    possible_strata = possible_strata,
+    observed_strata = nrow(strata),
+    empty_strata = possible_strata - nrow(strata),
+    minimum_n = min(sizes, na.rm = TRUE),
+    q1_n = unname(quantile(sizes, 0.25, na.rm = TRUE)),
+    median_n = median(sizes, na.rm = TRUE),
+    mean_n = mean(sizes, na.rm = TRUE),
+    q3_n = unname(quantile(sizes, 0.75, na.rm = TRUE)),
+    maximum_n = max(sizes, na.rm = TRUE),
+    strata_n_100_plus = sum(strata$n >= 100),
+    strata_n_50_plus = sum(strata$n >= 50),
+    strata_n_30_plus = sum(strata$n >= 30),
+    strata_n_20_plus = sum(strata$n >= 20),
+    strata_n_10_plus = sum(strata$n >= 10),
+    strata_n_below_10 = sum(strata$n < 10),
+    strata_no_events = sum(strata$events == 0),
+    strata_no_non_events = sum(strata$non_events == 0)
+  )
+}
+
+# =============================================================================
+# 6. MODEL FITTING
+# =============================================================================
+
+build_model_formulae <- function(model_axes) {
+  formula_a <- as.formula("cbind(events, non_events) ~ 1 + (1 | stratum)")
+  formula_b <- if (length(model_axes) == 0L) {
+    formula_a
+  } else {
+    as.formula(paste(
+      "cbind(events, non_events) ~",
+      paste(model_axes, collapse = " + "),
+      "+ (1 | stratum)"
+    ))
+  }
+  list(a = formula_a, b = formula_b)
+}
+
+fit_one_maihda <- function(strata, axes, model_axes, specification,
+                           specification_label, outcome, outcome_label,
+                           included_n, excluded_n, possible_strata,
+                           accounting) {
+  log_message("  Fitting ", specification, " / ", outcome,
+              " (", nrow(strata), " strata, ", sum(strata$n), " individuals)")
+
+  formulae <- build_model_formulae(model_axes)
+
+  fit_a <- fit_glmer_robust(formulae$a, strata, paste0(outcome, " / Model A"))
+  fit_b <- fit_glmer_robust(formulae$b, strata, paste0(outcome, " / Model B"))
+  model_a <- fit_a$model
+  model_b <- fit_b$model
+
+  variance_a <- random_intercept_variance(model_a)
+  variance_b <- random_intercept_variance(model_b)
+  pcv <- if (is.finite(variance_a) && variance_a > 0) {
+    100 * (variance_a - variance_b) / variance_a
+  } else {
+    NA_real_
+  }
+
+  # Singularity is reported with its interpretation attached. A zero variance
+  # in Model B is a finding; a zero variance in Model A is a problem.
+  if (fit_a$singular) {
+    log_message("    Model A variance is at the zero boundary. This implies no ",
+                "detectable between-stratum variation and should be ",
+                "investigated before the results are used.", level = "WARN")
+  }
+  if (fit_b$singular) {
+    log_message("    Model B variance is at the zero boundary",
+                if (fit_b$boundary_confirmed) {
+                  " (confirmed across all optimisers)"
+                } else {
+                  " (optimisers disagreed; see the fit attempts table)"
+                },
+                ". The additive main effects account for essentially all ",
+                "between-stratum variation, so no residual intersectional ",
+                "interaction is detected. PCV is at or near 100%.",
+                level = "NOTE")
+  }
+
+  predictions <- make_stratum_predictions(
+    model_a, model_b, strata, axes, specification, specification_label,
+    outcome, outcome_label
+  )
+
+  # AUC is computed from the prediction frame itself so that it cannot be
+  # invalidated by a change in row ordering elsewhere.
+  auc_for <- function(column) {
+    weighted_auc(predictions$events, predictions$non_events,
+                 predictions[[column]])
+  }
+
+  metrics <- data.frame(
+    specification = specification,
+    specification_label = specification_label,
+    outcome = outcome,
+    outcome_label = outcome_label,
+    min_stratum_n = MIN_STRATUM_N,
+    min_stratum_events = MIN_STRATUM_EVENTS,
+    included_n = included_n,
+    excluded_n = excluded_n,
+    analysed_n = sum(strata$n),
+    possible_strata = possible_strata,
+    strata_before_rule = accounting$strata_before,
+    observed_strata = nrow(strata),
+    strata_excluded_by_rule = accounting$strata_excluded,
+    individuals_excluded_by_rule = accounting$individuals_excluded,
+    individuals_retained_percent = accounting$individuals_retained_percent,
+    events_retained_percent = accounting$events_retained_percent,
+    event_n = sum(strata$events),
+    event_percent = 100 * sum(strata$events) / sum(strata$n),
+    variance_model_a = variance_a,
+    variance_model_b = variance_b,
+    vpc_model_a_percent = 100 * logistic_vpc(variance_a),
+    vpc_model_b_percent = 100 * logistic_vpc(variance_b),
+    pcv_percent = pcv,
+    mor_model_a = median_odds_ratio(variance_a),
+    mor_model_b = median_odds_ratio(variance_b),
+    auc_model_a_total = auc_for("null_total_probability"),
+    auc_model_a_fixed = auc_for("null_fixed_probability"),
+    auc_model_b_total = auc_for("total_probability"),
+    auc_model_b_fixed = auc_for("additive_probability"),
+    log_likelihood_model_a = as.numeric(logLik(model_a)),
+    log_likelihood_model_b = as.numeric(logLik(model_b)),
+    aic_model_a = AIC(model_a),
+    aic_model_b = AIC(model_b),
+    n_distinguishable = sum(predictions$interaction_distinguishable),
+    n_distinguishable_fdr = sum(predictions$interaction_distinguishable_fdr),
+    optimizer_model_a = fit_a$optimizer,
+    optimizer_model_b = fit_b$optimizer,
+    singular_model_a = fit_a$singular,
+    singular_model_b = fit_b$singular,
+    boundary_confirmed_model_a = fit_a$boundary_confirmed,
+    boundary_confirmed_model_b = fit_b$boundary_confirmed,
+    convergence_model_a = extract_convergence_message(model_a),
+    convergence_model_b = extract_convergence_message(model_b),
+    model_axes = paste(model_axes, collapse = " + "),
+    axes_dropped = paste(setdiff(axes, model_axes), collapse = ", ")
+  )
+
+  fit_attempts <- bind_rows(
+    fit_a$attempts %>% mutate(model = "A"),
+    fit_b$attempts %>% mutate(model = "B")
+  ) %>%
+    mutate(specification = specification, outcome = outcome) %>%
+    select(specification, outcome, model, everything())
+
+  fixed_effects <- extract_fixed_effects(
+    model_b, strata, model_axes, specification, specification_label,
+    outcome, outcome_label
+  )
+
+  if (SAVE_MODELS) {
+    model_file <- file.path(
+      OUTPUT_ROOT, "models", paste0(specification, "__", outcome, ".rds")
+    )
+    saveRDS(
+      list(
+        model_a = model_a,
+        model_b = model_b,
+        axes = axes,
+        model_axes = model_axes,
+        specification = specification,
+        outcome = outcome,
+        min_stratum_n = MIN_STRATUM_N,
+        min_stratum_events = MIN_STRATUM_EVENTS
+      ),
+      model_file
+    )
+    register_output(model_file)
+  }
+
+  list(
+    metrics = metrics,
+    fixed_effects = fixed_effects,
+    predictions = predictions,
+    fit_attempts = fit_attempts,
+    strata = strata
+  )
+}
+
+# A reduced fit used only by the threshold sweep. It returns the headline
+# variance measures and nothing else, so the sweep stays cheap.
+fit_metrics_only <- function(strata, axes, references, specification,
+                             specification_label, outcome, outcome_label,
+                             threshold) {
+  ruled <- apply_minimum_cell_rule(
+    strata, axes, references, threshold, MIN_STRATUM_EVENTS
+  )
+  base <- data.frame(
+    specification = specification,
+    specification_label = specification_label,
+    outcome = outcome,
+    outcome_label = outcome_label,
+    min_stratum_n = threshold,
+    strata_retained = ruled$accounting$strata_retained,
+    individuals_retained = ruled$accounting$individuals_retained,
+    individuals_retained_percent =
+      ruled$accounting$individuals_retained_percent,
+    events_retained_percent = ruled$accounting$events_retained_percent
+  )
+
+  if (nrow(ruled$data) < MIN_RETAINED_STRATA ||
+      length(ruled$model_axes) == 0L) {
+    return(bind_cols(base, data.frame(
+      variance_model_a = NA_real_, variance_model_b = NA_real_,
+      vpc_model_a_percent = NA_real_, vpc_model_b_percent = NA_real_,
+      pcv_percent = NA_real_, mor_model_a = NA_real_, mor_model_b = NA_real_,
+      singular_model_b = NA, status = "too few strata"
+    )))
+  }
+
+  formulae <- build_model_formulae(ruled$model_axes)
+  attempt <- tryCatch({
+    fit_a <- fit_glmer_robust(formulae$a, ruled$data, "sensitivity A")
+    fit_b <- fit_glmer_robust(formulae$b, ruled$data, "sensitivity B")
+    variance_a <- random_intercept_variance(fit_a$model)
+    variance_b <- random_intercept_variance(fit_b$model)
+    data.frame(
+      variance_model_a = variance_a,
+      variance_model_b = variance_b,
+      vpc_model_a_percent = 100 * logistic_vpc(variance_a),
+      vpc_model_b_percent = 100 * logistic_vpc(variance_b),
+      pcv_percent = if (is.finite(variance_a) && variance_a > 0) {
+        100 * (variance_a - variance_b) / variance_a
+      } else NA_real_,
+      mor_model_a = median_odds_ratio(variance_a),
+      mor_model_b = median_odds_ratio(variance_b),
+      singular_model_b = fit_b$singular,
+      status = "fitted"
+    )
+  }, error = function(condition) {
+    data.frame(
+      variance_model_a = NA_real_, variance_model_b = NA_real_,
+      vpc_model_a_percent = NA_real_, vpc_model_b_percent = NA_real_,
+      pcv_percent = NA_real_, mor_model_a = NA_real_, mor_model_b = NA_real_,
+      singular_model_b = NA,
+      status = paste("error:", conditionMessage(condition))
+    )
+  })
+
+  bind_cols(base, attempt)
+}
+
+# =============================================================================
+# 7. FIGURE FUNCTIONS
+# =============================================================================
+
+# The typeface is resolved once, against the fonts actually installed. Asking
+# for Arial on a Linux cluster otherwise produces a warning for every panel and
+# silently substitutes a different family anyway.
+resolve_font_family <- function(preferred) {
+  if (HAS_SYSTEMFONTS) {
+    available <- tryCatch(unique(systemfonts::system_fonts()$family),
+                          error = function(condition) character(0))
+    found <- preferred[preferred %in% available]
+    if (length(found) > 0L) return(found[1L])
+  }
+  ""
+}
+# ggplot2 renamed the scale transformation argument from `trans` to `transform`
+# in version 3.5.0, and passing the wrong one is a hard error rather than a
+# warning. Analysis machines routinely run whichever version their institution
+# froze, so the argument is selected at run time rather than assumed.
+GGPLOT2_USES_TRANSFORM <- utils::packageVersion("ggplot2") >= "3.5.0"
+scale_size_sqrt_compatible <- function(range) {
+  if (GGPLOT2_USES_TRANSFORM) {
+    scale_size_continuous(range = range, transform = "sqrt")
+  } else {
+    scale_size_continuous(range = range, trans = "sqrt")
+  }
+}
+
+PLOT_FONT <- resolve_font_family(PREFERRED_FONTS)
+if (!nzchar(PLOT_FONT)) {
+  log_message("None of the preferred typefaces are installed; using the ",
+              "graphics device default.", level = "NOTE")
+} else {
+  log_message("Figure typeface: ", PLOT_FONT)
+}
+
+# ggprism supplies clean, publication-oriented typography. Its default axes are
+# deliberately strong, so they are overridden with 0.3-point lines and ticks for
+# the lighter journal finish. When ggprism is unavailable the same finish is
+# built from theme_classic, so figures remain consistent either way rather than
+# the run failing over a cosmetic dependency.
+base_theme <- if (HAS_GGPRISM) {
+  ggprism::theme_prism(
+    base_size = 12, base_family = PLOT_FONT, base_fontface = "plain",
+    border = FALSE
+  )
+} else {
+  theme_classic(base_size = 12, base_family = PLOT_FONT) +
+    theme(
+      axis.text = element_text(colour = "black", face = "bold", size = 10),
+      axis.title = element_text(colour = "black", face = "bold", size = 12),
+      legend.text = element_text(size = 10),
+      plot.margin = margin(8, 8, 8, 8)
+    )
+}
+
+publication_theme <- base_theme +
+  theme(
+    axis.line = element_line(linewidth = 0.30, colour = "black"),
+    axis.ticks = element_line(linewidth = 0.30, colour = "black"),
+    axis.ticks.length = grid::unit(2.2, "pt"),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0),
+    plot.subtitle = element_text(size = 10, colour = "grey25"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    panel.spacing = grid::unit(1, "lines")
+  )
+
+# Restrained Nature-style palette. These colours are distinct in greyscale and
+# remain clear for common forms of colour-vision deficiency.
+nature_colours <- c(
+  vermillion = "#E64B35",
+  blue = "#3C5488",
+  teal = "#00A087",
+  coral = "#F39B7F",
+  lavender = "#8491B4",
+  cyan = "#4DBBD5",
+  charcoal = "#2F2F2F",
+  light_grey = "#B8B8B8"
+)
+colour_observed <- unname(nature_colours["vermillion"])
+colour_predicted <- unname(nature_colours["blue"])
+colour_interaction <- unname(nature_colours["teal"])
+colour_charcoal <- unname(nature_colours["charcoal"])
+
+add_condition_labels <- function(data) {
+  specification <- unique(data$specification)
+  if (length(specification) != 1L || !specification %in% names(SPECIFICATIONS)) {
+    stop("A single known specification is required to label strata.")
+  }
+  axes <- SPECIFICATIONS[[specification]]$axes
+  pieces <- lapply(axes, function(axis) {
+    paste0(display_name_for(axis), " = ", as.character(data[[axis]]))
+  })
+  data$condition_label <- do.call(paste, c(pieces, sep = "; "))
+
+  # A multi-line version is used inside figures. IMD parenthetical wording is
+  # shortened because the quintile number already identifies the category. The
+  # axes are distributed over three lines regardless of how many there are, so
+  # this does not silently break if a specification changes shape.
+  compact_values <- vapply(axes, function(axis) {
+    value <- as.character(data[[axis]])
+    if (axis %in% c("imd_quintile", "imd_3cat")) {
+      value <- sub(" \\(.*\\)$", "", value)
+    }
+    paste0(display_name_for(axis), " ", value)
+  }, character(nrow(data)))
+  if (is.null(dim(compact_values))) {
+    compact_values <- matrix(compact_values, nrow = nrow(data))
+  }
+  groups <- split(seq_along(axes), cut(seq_along(axes), breaks = 3,
+                                       labels = FALSE))
+  lines <- lapply(groups, function(indices) {
+    apply(compact_values[, indices, drop = FALSE], 1L, paste, collapse = "; ")
+  })
+  data$condition_plot_label <- do.call(paste, c(lines, sep = "\n"))
+  data
+}
+
+# Select equal numbers from the low and high ends while avoiding duplicated
+# rows when very few strata are available.
+select_plot_extremes <- function(data, ordering_variable,
+                                 number_each_end = N_PLOT_LABEL) {
+  if (nrow(data) == 0L) return(data)
+  ordered <- data[order(data[[ordering_variable]]), , drop = FALSE]
+  number_each_end <- min(number_each_end, ceiling(nrow(ordered) / 2))
+  unique(bind_rows(head(ordered, number_each_end),
+                   tail(ordered, number_each_end)))
+}
+
+# A shared placeholder keeps the multi-panel layouts intact when a panel has
+# nothing to show, instead of failing or silently changing the grid.
+empty_panel <- function(title, subtitle, message_text) {
+  ggplot() +
+    annotate("text", x = 0, y = 0, label = message_text,
+             family = PLOT_FONT, size = 4.2, colour = colour_charcoal,
+             lineheight = 1.25) +
+    xlim(-1, 1) + ylim(-1, 1) +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    publication_theme +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          axis.line = element_blank())
+}
+
+make_figures <- function(predictions, metrics_row) {
+  predictions <- add_condition_labels(predictions)
+  title_suffix <- paste(
+    unique(predictions$specification_label),
+    unique(predictions$outcome_label), sep = ": "
+  )
+  cell_rule_caption <- paste0(
+    "Strata with n < ", metrics_row$min_stratum_n,
+    if (metrics_row$min_stratum_events > 0) {
+      paste0(" or fewer than ", metrics_row$min_stratum_events, " events")
+    } else "",
+    " excluded: ", metrics_row$observed_strata, " of ",
+    metrics_row$strata_before_rule, " strata retained (",
+    formatC(metrics_row$individuals_retained_percent, format = "f", digits = 1),
+    "% of individuals)."
+  )
+  model_b_singular <- isTRUE(metrics_row$singular_model_b)
+
+  # Panel A parallels the tutorial's observed and precision-weighted
+  # distribution comparison. Strata are weighted equally in this plot because
+  # the object of interest is the distribution across strata.
+  distribution_data <- bind_rows(
+    data.frame(
+      probability = predictions$observed_probability,
+      type = "Observed stratum proportion"
+    ),
+    data.frame(
+      probability = predictions$null_total_probability,
+      type = "Model A precision-weighted prediction"
+    )
+  )
+  p_distribution <- ggplot(distribution_data,
+                           aes(x = probability, fill = type)) +
+    geom_histogram(
+      aes(y = after_stat(count / sum(count))),
+      bins = 35, position = "identity", alpha = 0.55, colour = "white"
+    ) +
+    scale_x_continuous(labels = percent_format(accuracy = 1)) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_fill_manual(values = c(
+      "Observed stratum proportion" = colour_observed,
+      "Model A precision-weighted prediction" = colour_predicted
+    )) +
+    labs(
+      title = "A. Observed and precision-weighted stratum risks",
+      subtitle = title_suffix,
+      x = "Event probability", y = "Percentage of strata", fill = NULL,
+      caption = cell_rule_caption
+    ) + publication_theme +
+    theme(plot.caption = element_text(size = 7.5, colour = "grey35",
+                                      hjust = 0))
+
+  # Panel B is the tutorial-style caterpillar plot of Model B predictions.
+  ordered_prediction <- predictions %>% arrange(total_probability)
+  prediction_labels <- select_plot_extremes(
+    ordered_prediction, "total_probability"
+  )
+  p_caterpillar <- ggplot(
+    ordered_prediction,
+    aes(x = prediction_rank, y = total_probability)
+  ) +
+    geom_linerange(
+      aes(ymin = total_probability_low, ymax = total_probability_high),
+      colour = "grey65", linewidth = 0.25, alpha = 0.7
+    ) +
+    geom_point(colour = colour_predicted, size = 0.7) +
+    ggrepel::geom_text_repel(
+      data = prediction_labels,
+      aes(label = condition_plot_label),
+      size = LABEL_SIZE_CALLOUT, family = PLOT_FONT, colour = colour_charcoal,
+      min.segment.length = 0, segment.size = 0.25,
+      box.padding = 0.55, point.padding = 0.25,
+      max.overlaps = Inf, seed = 20260814, show.legend = FALSE
+    ) +
+    scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+    labs(
+      title = "B. Predicted risk by intersectional stratum",
+      subtitle = "Model B: additive main effects plus stratum random effect",
+      x = "Stratum rank", y = "Predicted event probability"
+    ) + publication_theme
+
+  # Panel C shows the stratum interaction residual on the probability scale.
+  # Values above zero indicate higher risk than predicted by additive effects;
+  # values below zero indicate lower risk than predicted additively.
+  ordered_interaction <- predictions %>%
+    arrange(interaction_probability_difference)
+
+  if (model_b_singular) {
+    # With the variance at the boundary every residual is zero. Drawing the
+    # usual panel would show a flat line at zero with no explanation, which
+    # reads as a plotting failure rather than as the result it actually is.
+    p_interaction <- empty_panel(
+      "C. Intersectional interaction residuals",
+      title_suffix,
+      paste0(
+        "Model B between-stratum variance estimated at zero.\n",
+        "Additive main effects account for all between-stratum\n",
+        "variation, so no residual interaction is present.\n",
+        "PCV = ", formatC(metrics_row$pcv_percent, format = "f", digits = 1),
+        "%."
+      )
+    )
+  } else {
+    interaction_label_pool <- ordered_interaction %>%
+      filter(interaction_distinguishable)
+    if (nrow(interaction_label_pool) == 0L) {
+      interaction_label_pool <- ordered_interaction
+    }
+    interaction_labels <- select_plot_extremes(
+      interaction_label_pool, "interaction_probability_difference",
+      number_each_end = 1L
+    )
+    p_interaction <- ggplot(
+      ordered_interaction,
+      aes(x = interaction_rank, y = interaction_probability_difference)
+    ) +
+      geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey25") +
+      geom_linerange(
+        aes(ymin = interaction_probability_difference_low,
+            ymax = interaction_probability_difference_high,
+            colour = interaction_distinguishable),
+        linewidth = 0.25, alpha = 0.75
+      ) +
+      geom_point(aes(colour = interaction_distinguishable), size = 0.7) +
+      ggrepel::geom_text_repel(
+        data = interaction_labels,
+        aes(label = condition_plot_label),
+        size = LABEL_SIZE_CALLOUT, family = PLOT_FONT,
+        colour = colour_charcoal,
+        min.segment.length = 0, segment.size = 0.25,
+        box.padding = 0.55, point.padding = 0.25,
+        max.overlaps = Inf, seed = 20260814, show.legend = FALSE
+      ) +
+      scale_colour_manual(
+        values = c(`FALSE` = "grey55", `TRUE` = colour_interaction),
+        labels = c(`FALSE` = "Interval includes zero",
+                   `TRUE` = "Interval excludes zero"),
+        drop = FALSE
+      ) +
+      scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+      labs(
+        title = "C. Intersectional interaction residuals",
+        subtitle = "Difference from additive predicted probability",
+        x = "Stratum rank", y = "Probability difference", colour = NULL
+      ) + publication_theme
+  }
+
+  # Panel E presents the interactions that survive multiplicity control as a
+  # named horizontal forest plot. Only strata significant after Benjamini-
+  # Hochberg correction are shown: with several hundred strata compared
+  # simultaneously, an uncorrected interval excluding zero is not evidence of
+  # an interaction, and plotting those strata alongside the real ones invites
+  # them to be read as findings. The uncorrected flag is retained in
+  # all_stratum_predictions.csv for anyone who needs it.
+  significant_interactions <- predictions %>%
+    filter(interaction_distinguishable_fdr) %>%
+    arrange(interaction_probability_difference) %>%
+    mutate(condition_plot_label = factor(
+      condition_plot_label, levels = unique(condition_plot_label)
+    ))
+
+  n_uncorrected <- sum(predictions$interaction_distinguishable)
+
+  if (nrow(significant_interactions) > 0L) {
+    p_significant <- ggplot(
+      significant_interactions,
+      aes(x = interaction_probability_difference, y = condition_plot_label,
+          colour = interaction_probability_difference > 0)
+    ) +
+      geom_vline(xintercept = 0, linewidth = 0.35, colour = "grey35") +
+      geom_errorbar(
+        aes(xmin = interaction_probability_difference_low,
+            xmax = interaction_probability_difference_high),
+        orientation = "y", width = 0, linewidth = 0.45
+      ) +
+      geom_point(size = 2.4) +
+      scale_colour_manual(
+        values = c(`FALSE` = unname(nature_colours["blue"]),
+                   `TRUE` = unname(nature_colours["vermillion"])),
+        labels = c(`FALSE` = "Lower than additive expectation",
+                   `TRUE` = "Higher than additive expectation"),
+        drop = FALSE
+      ) +
+      scale_x_continuous(labels = percent_format(accuracy = 0.1),
+                         expand = expansion(mult = 0.06)) +
+      labs(
+        title = "E. Intersectional interaction residuals surviving FDR correction",
+        subtitle = paste0(
+          nrow(significant_interactions), " of ", nrow(predictions),
+          " strata significant at FDR < ", FDR_LEVEL,
+          " (", n_uncorrected, " before correction)"
+        ),
+        x = "Difference from additive predicted probability", y = NULL,
+        colour = NULL
+      ) + publication_theme +
+      theme(axis.text.y = element_text(size = LABEL_SIZE_AXIS,
+                                       lineheight = 1.05),
+            legend.position = "bottom")
+  } else {
+    p_significant <- empty_panel(
+      "E. Intersectional interaction residuals surviving FDR correction",
+      title_suffix,
+      if (model_b_singular) {
+        paste0("Model B between-stratum variance estimated at zero.\n",
+               "No interaction residuals to display.")
+      } else {
+        paste0(
+          "No stratum interaction is significant at FDR < ", FDR_LEVEL, ".\n",
+          n_uncorrected, " of ", nrow(predictions),
+          " strata had an uncorrected interval excluding zero,\n",
+          "which is consistent with chance across this many comparisons."
+        )
+      }
+    )
+  }
+
+  # Panel D illustrates partial pooling directly. Small strata often have
+  # volatile observed proportions and are pulled more strongly towards the
+  # model prediction.
+  p_shrinkage <- ggplot(
+    predictions,
+    aes(x = observed_probability, y = total_probability, size = n)
+  ) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+                linewidth = 0.45, colour = "grey40") +
+    geom_point(alpha = 0.55, colour = colour_predicted) +
+    scale_x_continuous(labels = percent_format(accuracy = 1)) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_size_sqrt_compatible(range = c(0.6, 4.2)) +
+    labs(
+      title = "D. Partial pooling of observed stratum risks",
+      subtitle = paste0(
+        "VPC A = ", round(metrics_row$vpc_model_a_percent, 2),
+        "%; VPC B = ", round(metrics_row$vpc_model_b_percent, 2),
+        "%; PCV = ", round(metrics_row$pcv_percent, 1), "%"
+      ),
+      x = "Observed event proportion", y = "Model B predicted probability",
+      size = "Stratum n"
+    ) + publication_theme
+
+  combined_four <- (p_distribution | p_caterpillar) /
+    (p_interaction | p_shrinkage) +
+    plot_annotation(title = title_suffix, tag_levels = NULL)
+
+  combined_five <- (p_distribution | p_caterpillar) /
+    (p_interaction | p_shrinkage) /
+    p_significant +
+    plot_layout(heights = c(
+      1, 1, max(1.5, nrow(significant_interactions) / 5)
+    )) +
+    plot_annotation(title = title_suffix, tag_levels = NULL)
+
+  list(
+    distribution = p_distribution,
+    caterpillar = p_caterpillar,
+    interaction = p_interaction,
+    shrinkage = p_shrinkage,
+    significant = p_significant,
+    combined_four = combined_four,
+    combined_five = combined_five,
+    n_significant = nrow(significant_interactions)
+  )
+}
+
+# Figure writing is wrapped so that a single failed device cannot end a run
+# that has already produced valid model results.
+save_plot_pair <- function(plot, path_without_extension, width, height) {
+  png_path <- paste0(path_without_extension, ".png")
+  status <- tryCatch({
+    ggsave(png_path, plot, width = width, height = height,
+           dpi = FIGURE_DPI, bg = "white", limitsize = FALSE)
+    register_output(png_path)
+    TRUE
+  }, error = function(condition) {
+    log_message("Could not write ", png_path, ": ",
+                conditionMessage(condition), level = "WARN")
+    FALSE
+  })
+
+  if (WRITE_SVG) {
+    svg_path <- paste0(path_without_extension, ".svg")
+    tryCatch({
+      ggsave(svg_path, plot, width = width, height = height, bg = "white",
+             limitsize = FALSE)
+      register_output(svg_path)
+    }, error = function(condition) {
+      log_message("Could not write ", svg_path, ": ",
+                  conditionMessage(condition), level = "WARN")
+    })
+  }
+  invisible(status)
+}
+
+# =============================================================================
+# 8. RUN EVERY SPECIFICATION AND OUTCOME
+# =============================================================================
+
+all_metrics <- list()
+all_fixed_effects <- list()
+all_predictions <- list()
+all_extremes <- list()
+all_significant <- list()
+all_size_summaries <- list()
+all_retention <- list()
+all_excluded_strata <- list()
+all_reference_changes <- list()
+all_fit_attempts <- list()
+all_failures <- list()
+all_figure_failures <- list()
+sensitivity_results <- list()
+
+total_analyses <- length(SPECIFICATIONS) * length(OUTCOME_LABELS)
+run_index <- 0L
+
+for (specification_name in names(SPECIFICATIONS)) {
+  specification <- SPECIFICATIONS[[specification_name]]
+  axes <- specification$axes
+
+  log_message("Preparing specification: ", specification$label)
+  prepared <- prepare_analysis_data(
+    analysis_master, axes, specification$references, names(OUTCOME_LABELS)
+  )
+
+  for (outcome in names(OUTCOME_LABELS)) {
+    run_index <- run_index + 1L
+    outcome_label <- unname(OUTCOME_LABELS[outcome])
+    result_key <- paste(specification_name, outcome, sep = "__")
+    table_prefix <- file.path(
+      OUTPUT_ROOT, "tables", "per_analysis",
+      paste0(specification_name, "__", outcome)
+    )
+
+    log_message("[", run_index, "/", total_analyses, "] ",
+                specification$label, " - ", outcome_label)
+
+    # Each analysis is isolated. A failure on one outcome is recorded and the
+    # run continues, rather than discarding every result computed so far.
+    analysis_status <- tryCatch({
+      if (RESUME && file.exists(paste0(table_prefix, "__metrics.csv"))) {
+        log_message("  Existing results found; skipping (resume mode).")
+        all_metrics[[result_key]] <- read.csv(
+          paste0(table_prefix, "__metrics.csv")
+        )
+        "skipped"
+      } else {
+        counted <- make_stratum_counts(prepared, axes, outcome)
+
+        all_size_summaries[[paste0(result_key, "__before")]] <-
+          stratum_size_summary(
+            counted$data, specification_name, specification$label,
+            outcome, outcome_label, counted$included_n, counted$excluded_n,
+            counted$possible_strata, stage = "before minimum cell rule"
+          )
+
+        ruled <- apply_minimum_cell_rule(
+          counted$data, axes, specification$references,
+          MIN_STRATUM_N, MIN_STRATUM_EVENTS
+        )
+
+        retention_row <- bind_cols(
+          data.frame(
+            specification = specification_name,
+            specification_label = specification$label,
+            outcome = outcome,
+            outcome_label = outcome_label
+          ),
+          ruled$accounting
+        )
+        all_retention[[result_key]] <- retention_row
+
+        log_message("  Minimum cell rule: ", ruled$accounting$strata_retained,
+                    " of ", ruled$accounting$strata_before, " strata retained (",
+                    formatC(ruled$accounting$individuals_retained_percent,
+                            format = "f", digits = 1),
+                    "% of individuals, ",
+                    formatC(ruled$accounting$events_retained_percent,
+                            format = "f", digits = 1), "% of events).")
+
+        if (nrow(ruled$excluded) > 0L) {
+          # The label is captured before the pipe. Assigning a `specification`
+          # column inside mutate() shadows the outer `specification` list, so
+          # referring to `specification$label` in a later argument of the same
+          # mutate would resolve to the new character column.
+          current_specification_label <- specification$label
+          all_excluded_strata[[result_key]] <- ruled$excluded %>%
+            mutate(specification = specification_name,
+                   specification_label = current_specification_label,
+                   outcome = outcome, outcome_label = outcome_label,
+                   exclusion_reason = case_when(
+                     n < MIN_STRATUM_N & events < MIN_STRATUM_EVENTS ~
+                       "below size and event thresholds",
+                     n < MIN_STRATUM_N ~ "below size threshold",
+                     TRUE ~ "below event threshold"
+                   ))
+        }
+        if (nrow(ruled$reference_changes) > 0L) {
+          all_reference_changes[[result_key]] <- ruled$reference_changes %>%
+            mutate(specification = specification_name, outcome = outcome)
+          for (change_index in seq_len(nrow(ruled$reference_changes))) {
+            change <- ruled$reference_changes[change_index, ]
+            log_message("  Reference level '", change$intended_reference,
+                        "' for ", change$variable, " did not survive the ",
+                        "minimum cell rule; using '", change$used_reference,
+                        "' instead.", level = "WARN")
+          }
+        }
+        if (length(ruled$dropped_axes) > 0L) {
+          log_message("  Axes reduced to a single category and removed from ",
+                      "the fixed effects: ",
+                      paste(ruled$dropped_axes, collapse = ", "),
+                      level = "WARN")
+        }
+
+        if (nrow(ruled$data) < MIN_RETAINED_STRATA) {
+          stop("Only ", nrow(ruled$data), " strata survived the minimum cell ",
+               "rule (minimum required: ", MIN_RETAINED_STRATA,
+               "). Lower MAIHDA_MIN_STRATUM_N or use the collapsed ",
+               "specification for this outcome.")
+        }
+        if (length(ruled$model_axes) == 0L) {
+          stop("No axis retained more than one category after the minimum ",
+               "cell rule; Model B is not identifiable.")
+        }
+
+        all_size_summaries[[paste0(result_key, "__after")]] <-
+          stratum_size_summary(
+            ruled$data, specification_name, specification$label,
+            outcome, outcome_label, sum(ruled$data$n), counted$excluded_n,
+            counted$possible_strata, stage = "after minimum cell rule"
+          )
+
+        fit <- fit_one_maihda(
+          ruled$data, axes, ruled$model_axes, specification_name,
+          specification$label, outcome, outcome_label,
+          counted$included_n, counted$excluded_n, counted$possible_strata,
+          ruled$accounting
+        )
+
+        all_metrics[[result_key]] <- fit$metrics
+        all_fixed_effects[[result_key]] <- fit$fixed_effects
+        all_fit_attempts[[result_key]] <- fit$fit_attempts
+        labelled_predictions <- add_condition_labels(fit$predictions)
+        all_predictions[[result_key]] <- labelled_predictions
+
+        ranked <- labelled_predictions %>% arrange(total_probability)
+        all_extremes[[result_key]] <- bind_rows(
+          head(ranked, N_EXTREME) %>% mutate(extreme = "Lowest predicted risk"),
+          tail(ranked, N_EXTREME) %>% mutate(extreme = "Highest predicted risk")
+        )
+        # Matches what panel E plots: only strata surviving FDR correction are
+        # presented as findings. Every stratum, with both the corrected and
+        # uncorrected flags, remains in all_stratum_predictions.csv.
+        all_significant[[result_key]] <- labelled_predictions %>%
+          filter(interaction_distinguishable_fdr)
+
+        # Per-analysis tables are written alongside the consolidated tables so
+        # that a single model can be inspected or shared on its own.
+        write_csv_output(fit$metrics, paste0(table_prefix, "__metrics.csv"))
+        write_csv_output(fit$fixed_effects,
+                         paste0(table_prefix, "__fixed_effects.csv"))
+        write_csv_output(labelled_predictions,
+                         paste0(table_prefix, "__stratum_predictions.csv"))
+        write_csv_output(retention_row,
+                         paste0(table_prefix, "__stratum_retention.csv"))
+
+        # Figures are isolated from the analysis result. The model output is
+        # already written by this point, so a device or layout failure is
+        # recorded as a figure problem and must not mark a completed analysis
+        # as failed.
+        figure_status <- tryCatch({
+        figure_list <- make_figures(fit$predictions, fit$metrics)
+        figure_prefix <- file.path(
+          OUTPUT_ROOT, "figures", "individual",
+          paste0(specification_name, "__", outcome)
+        )
+        save_plot_pair(figure_list$distribution,
+                       paste0(figure_prefix, "__A_distribution"),
+                       FIGURE_WIDTH, FIGURE_HEIGHT)
+        save_plot_pair(figure_list$caterpillar,
+                       paste0(figure_prefix, "__B_caterpillar"),
+                       FIGURE_WIDTH, FIGURE_HEIGHT)
+        save_plot_pair(figure_list$interaction,
+                       paste0(figure_prefix, "__C_interactions"),
+                       FIGURE_WIDTH, FIGURE_HEIGHT)
+        save_plot_pair(figure_list$shrinkage,
+                       paste0(figure_prefix, "__D_shrinkage"),
+                       FIGURE_WIDTH, FIGURE_HEIGHT)
+        # The height expands with the number of retained interactions so every
+        # condition remains legible without reducing the text to an
+        # impractical size. Each stratum label occupies three lines, so the
+        # per-stratum allowance is generous; the ceiling is high enough that a
+        # long list stays readable rather than being compressed to fit. The
+        # floor is kept low because FDR correction routinely leaves one or two
+        # strata, and a tall panel holding a single row is mostly whitespace.
+        significant_height <- max(
+          3.4, min(30, 2.8 + 0.5 * figure_list$n_significant)
+        )
+        save_plot_pair(figure_list$significant,
+                       paste0(figure_prefix, "__E_significant_interactions"),
+                       width = 10.5, height = significant_height)
+        save_plot_pair(
+          figure_list$combined_four,
+          file.path(OUTPUT_ROOT, "figures", "multipanel",
+                    paste0(specification_name, "__", outcome, "__four_panel")),
+          width = 15, height = 11
+        )
+        save_plot_pair(
+          figure_list$combined_five,
+          file.path(OUTPUT_ROOT, "figures", "multipanel",
+                    paste0(specification_name, "__", outcome, "__five_panel")),
+          width = 15, height = 12 + significant_height
+        )
+        rm(figure_list)
+        "ok"
+        }, error = function(condition) {
+          log_message("  Figures could not be produced: ",
+                      conditionMessage(condition), level = "WARN")
+          all_figure_failures[[result_key]] <<- data.frame(
+            specification = specification_name,
+            outcome = outcome,
+            message = conditionMessage(condition)
+          )
+          "failed"
+        })
+
+        rm(fit, labelled_predictions)
+        "completed"
+      }
+    }, error = function(condition) {
+      log_message("  FAILED: ", conditionMessage(condition), level = "ERROR")
+      all_failures[[result_key]] <<- data.frame(
+        specification = specification_name,
+        specification_label = specification$label,
+        outcome = outcome,
+        outcome_label = outcome_label,
+        message = conditionMessage(condition)
+      )
+      "failed"
+    })
+
+    invisible(gc(verbose = FALSE))
+  }
+}
+
+completed_analyses <- length(all_metrics)
+if (completed_analyses == 0L) {
+  # Writing the failure log before stopping means the reason is preserved even
+  # though no results exist.
+  if (length(all_failures) > 0L) {
+    write_csv_output(bind_rows(all_failures),
+                     file.path(OUTPUT_ROOT, "tables", "failed_analyses.csv"))
+  }
+  stop("Every analysis failed. See ", LOG_PATH, " and failed_analyses.csv.")
+}
+log_message("Model fitting complete: ", completed_analyses, " of ",
+            total_analyses, " analyses produced results.")
+
+# =============================================================================
+# 9. MINIMUM CELL SIZE THRESHOLD SENSITIVITY
+# =============================================================================
+# The threshold is a judgement call, so it is worth showing what it costs and
+# what it changes. This refits Models A and B for a single outcome across a
+# range of thresholds and reports the retained sample alongside the headline
+# variance measures.
+
+if (RUN_THRESHOLD_SENSITIVITY && SENSITIVITY_OUTCOME %in% names(OUTCOME_LABELS)) {
+  log_message("Running minimum cell size sensitivity sweep for ",
+              SENSITIVITY_OUTCOME, " across thresholds: ",
+              paste(SENSITIVITY_THRESHOLDS, collapse = ", "))
+  for (specification_name in names(SPECIFICATIONS)) {
+    specification <- SPECIFICATIONS[[specification_name]]
+    prepared <- prepare_analysis_data(
+      analysis_master, specification$axes, specification$references,
+      names(OUTCOME_LABELS)
+    )
+    counted <- tryCatch(
+      make_stratum_counts(prepared, specification$axes, SENSITIVITY_OUTCOME),
+      error = function(condition) NULL
+    )
+    if (is.null(counted)) next
+
+    for (threshold in SENSITIVITY_THRESHOLDS) {
+      key <- paste(specification_name, threshold, sep = "__")
+      sensitivity_results[[key]] <- tryCatch(
+        fit_metrics_only(
+          counted$data, specification$axes, specification$references,
+          specification_name, specification$label, SENSITIVITY_OUTCOME,
+          unname(OUTCOME_LABELS[SENSITIVITY_OUTCOME]), threshold
+        ),
+        error = function(condition) NULL
+      )
+    }
+  }
+  log_message("Sensitivity sweep complete.")
+}
+
+sensitivity_table <- if (length(sensitivity_results) > 0L) {
+  bind_rows(sensitivity_results)
+} else {
+  data.frame()
+}
+
+# =============================================================================
+# 10. CONSOLIDATED TABLES
+# =============================================================================
+
+metrics_table <- bind_rows(all_metrics)
+fixed_effects_table <- bind_rows(all_fixed_effects)
+predictions_table <- bind_rows(all_predictions)
+extremes_table <- bind_rows(all_extremes)
+significant_table <- bind_rows(all_significant)
+size_summary_table <- bind_rows(all_size_summaries)
+retention_table <- bind_rows(all_retention)
+excluded_strata_table <- bind_rows(all_excluded_strata)
+reference_changes_table <- bind_rows(all_reference_changes)
+fit_attempts_table <- bind_rows(all_fit_attempts)
+failures_table <- bind_rows(all_failures)
+figure_failures_table <- bind_rows(all_figure_failures)
+
+write_csv_output(metrics_table,
+                 file.path(OUTPUT_ROOT, "tables", "all_model_metrics.csv"))
+write_csv_output(fixed_effects_table,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "all_fixed_effects_odds_ratios.csv"))
+write_csv_output(predictions_table,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "all_stratum_predictions.csv"))
+write_csv_output(extremes_table,
+                 file.path(OUTPUT_ROOT, "tables", "extreme_strata.csv"))
+write_csv_output(significant_table,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "distinguishable_interaction_strata.csv"))
+write_csv_output(size_summary_table,
+                 file.path(OUTPUT_ROOT, "tables", "stratum_size_summary.csv"))
+write_csv_output(retention_table,
+                 file.path(OUTPUT_ROOT, "tables", "stratum_retention.csv"))
+write_csv_output(fit_attempts_table,
+                 file.path(OUTPUT_ROOT, "tables", "model_fit_attempts.csv"))
+if (nrow(excluded_strata_table) > 0L) {
+  write_csv_output(excluded_strata_table,
+                   file.path(OUTPUT_ROOT, "tables", "excluded_strata.csv"))
+}
+if (nrow(reference_changes_table) > 0L) {
+  write_csv_output(reference_changes_table,
+                   file.path(OUTPUT_ROOT, "tables",
+                             "reference_level_changes.csv"))
+}
+if (nrow(failures_table) > 0L) {
+  write_csv_output(failures_table,
+                   file.path(OUTPUT_ROOT, "tables", "failed_analyses.csv"))
+}
+if (nrow(figure_failures_table) > 0L) {
+  write_csv_output(figure_failures_table,
+                   file.path(OUTPUT_ROOT, "tables", "failed_figures.csv"))
+}
+if (nrow(sensitivity_table) > 0L) {
+  write_csv_output(sensitivity_table,
+                   file.path(OUTPUT_ROOT, "tables",
+                             "minimum_cell_sensitivity.csv"))
+}
+
+# =============================================================================
+# 11. APA-FORMATTED WORD TABLES
+# =============================================================================
+
+# The Word exports use officer for document structure and flextable for stable
+# table layout. The visual treatment follows APA conventions: table number in
+# bold, title in italics, no vertical rules, three restrained horizontal rules,
+# repeated headers and a compact note beneath each table. Letter landscape is
+# used because the model summaries are genuinely wide tabular material.
+
+format_number <- function(x, digits = 2) {
+  ifelse(is.na(x), "", formatC(x, format = "f", digits = digits,
+                               big.mark = ","))
+}
+
+format_integer <- function(x) {
+  ifelse(is.na(x), "", formatC(round(as.numeric(x)), format = "d",
+                               big.mark = ","))
+}
+
+format_p_value <- function(x) {
+  ifelse(is.na(x), "",
+         ifelse(x < 0.001, "< .001",
+                sub("^0", "", formatC(x, format = "f", digits = 3))))
+}
+
+# flextable validates opts_word strictly and the accepted keys have changed
+# across releases, so an option that is merely cosmetic can otherwise abort the
+# whole Word export. The richest supported set is used and the script falls
+# back rather than failing. Header rows repeat across pages by default in Word
+# output, so nothing important is lost by the fallback.
+apply_word_table_properties <- function(table) {
+  option_sets <- list(
+    list(split = FALSE, keep_with_next = TRUE),
+    list(split = FALSE),
+    list()
+  )
+  for (options in option_sets) {
+    attempt <- try(
+      flextable::set_table_properties(
+        table, layout = "autofit", width = 1, opts_word = options
+      ),
+      silent = TRUE
+    )
+    if (!inherits(attempt, "try-error")) return(attempt)
+  }
+  flextable::set_table_properties(table, layout = "autofit", width = 1)
+}
+
+make_apa_flextable <- function(data, font_size = 9) {
+  table <- flextable::flextable(data)
+  table <- flextable::theme_booktabs(table, bold_header = TRUE)
+  table <- flextable::font(table, fontname = "Times New Roman", part = "all")
+  table <- flextable::fontsize(table, size = font_size, part = "all")
+  table <- flextable::align(table, align = "left", part = "all")
+  descriptive_columns <- intersect(
+    names(data),
+    c("Outcome", "Specification", "Term", "Variable", "Level", "Stratum",
+      "Extreme", "Status")
+  )
+  value_columns <- setdiff(names(data), descriptive_columns)
+  if (length(value_columns) > 0L) {
+    table <- flextable::align(
+      table, j = value_columns, align = "right", part = "body"
+    )
+  }
+  table <- flextable::valign(table, valign = "center", part = "all")
+  table <- flextable::padding(
+    table, padding.top = 3, padding.bottom = 3,
+    padding.left = 4, padding.right = 4, part = "all"
+  )
+  table <- apply_word_table_properties(table)
+  table <- flextable::autofit(table)
+  flextable::fit_to_width(table, max_width = 9)
+}
+
+new_apa_table_document <- function() {
+  document <- officer::read_docx()
+  landscape_section <- officer::prop_section(
+    page_size = officer::page_size(
+      orient = "landscape", width = 11, height = 8.5
+    ),
+    page_margins = officer::page_mar(
+      top = 1, bottom = 1, left = 1, right = 1,
+      header = 0.492, footer = 0.492
+    )
+  )
+  officer::body_set_default_section(document, landscape_section)
+}
+
+add_apa_table <- function(document, table_number, table_title, table_data,
+                          table_note, add_page_break = FALSE,
+                          font_size = 9) {
+  if (add_page_break) {
+    document <- officer::body_add_break(document)
+    # A short spacer prevents LibreOffice and Word from pinning the following
+    # table number against the printable page boundary after an explicit break.
+    document <- officer::body_add_par(
+      document, intToUtf8(160L), style = "Normal"
+    )
+  }
+
+  number_style <- officer::fp_text(
+    font.family = "Times New Roman", font.size = 12, bold = TRUE
+  )
+  title_style <- officer::fp_text(
+    font.family = "Times New Roman", font.size = 12, italic = TRUE
+  )
+  note_label_style <- officer::fp_text(
+    font.family = "Times New Roman", font.size = 9, italic = TRUE
+  )
+  note_style <- officer::fp_text(
+    font.family = "Times New Roman", font.size = 9
+  )
+
+  document <- officer::body_add_fpar(
+    document,
+    officer::fpar(officer::ftext(paste("Table", table_number), number_style),
+                  fp_p = officer::fp_par(
+                    padding.top = 4, padding.bottom = 2,
+                    keep_with_next = TRUE
+                  ))
+  )
+  document <- officer::body_add_fpar(
+    document,
+    officer::fpar(officer::ftext(table_title, title_style),
+                  fp_p = officer::fp_par(
+                    padding.bottom = 6, keep_with_next = TRUE
+                  ))
+  )
+  document <- flextable::body_add_flextable(
+    document, make_apa_flextable(table_data, font_size = font_size)
+  )
+  document <- officer::body_add_fpar(
+    document,
+    officer::fpar(
+      officer::ftext("Note. ", note_label_style),
+      officer::ftext(table_note, note_style),
+      fp_p = officer::fp_par(padding.top = 5, padding.bottom = 6)
+    )
+  )
+  document
+}
+
+write_apa_table_document <- function(path, table_number, table_title,
+                                     table_data, table_note,
+                                     font_size = 9) {
+  document <- new_apa_table_document()
+  document <- add_apa_table(
+    document, table_number, table_title, table_data, table_note,
+    font_size = font_size
+  )
+  print(document, target = path)
+  register_output(path)
+  invisible(path)
+}
+
+# Prepare presentation versions separately from the analysis tables. This
+# preserves full-precision CSV outputs while giving Word readers sensible
+# rounding, descriptive headings and conventional p-value formatting.
+word_cohort_characteristics <- cohort_characteristics %>%
+  transmute(
+    Variable = variable_label,
+    Level = ifelse(is_reference, paste0(level, " (ref)"), level),
+    `n` = format_integer(n),
+    `%` = format_number(percent, 1),
+    `Missing n` = format_integer(missing_n),
+    `Missing %` = format_number(missing_percent, 2)
+  )
+
+word_outcome_counts <- outcome_counts %>%
+  transmute(
+    Outcome = outcome_label,
+    `Complete N` = format_integer(complete_n),
+    `Missing N` = format_integer(missing_n),
+    Events = format_integer(event_n),
+    `Non-events` = format_integer(non_event_n),
+    `Event %` = format_number(event_percent, 2)
+  )
+
+word_event_rates <- descriptive_event_rates %>%
+  transmute(
+    Outcome = outcome_label,
+    Variable = variable_label,
+    Level = ifelse(is_reference, paste0(level, " (ref)"), level),
+    `n` = format_integer(n),
+    Events = format_integer(events),
+    `Event %` = format_number(event_percent, 2),
+    `95% CI` = paste0(format_number(ci_low_percent, 2), " to ",
+                      format_number(ci_high_percent, 2))
+  )
+
+word_stratum_distribution <- descriptive_stratum_distribution %>%
+  transmute(
+    Specification = specification_label,
+    `Possible strata` = format_integer(possible_strata),
+    `Observed strata` = format_integer(observed_strata),
+    `Empty strata` = format_integer(empty_strata),
+    `Median n` = format_number(median_n, 1),
+    `IQR` = paste0(format_number(q1_n, 0), " to ", format_number(q3_n, 0)),
+    `Minimum n` = format_integer(minimum_n),
+    `Maximum n` = format_integer(maximum_n),
+    `n < 10` = format_integer(strata_below_10),
+    `10-29` = format_integer(strata_10_to_29),
+    `30-99` = format_integer(strata_30_to_99),
+    `100+` = format_integer(strata_100_plus)
+  )
+
+word_retention <- retention_table %>%
+  transmute(
+    Specification = specification_label,
+    Outcome = outcome_label,
+    `Strata before` = format_integer(strata_before),
+    `Strata retained` = format_integer(strata_retained),
+    `Strata excluded` = format_integer(strata_excluded),
+    `Individuals retained` = format_integer(individuals_retained),
+    `Individuals retained %` = format_number(individuals_retained_percent, 1),
+    `Events retained %` = format_number(events_retained_percent, 1),
+    `Largest excluded n` = format_integer(excluded_max_n)
+  )
+
+word_model_metrics <- metrics_table %>%
+  transmute(
+    Specification = specification_label,
+    Outcome = outcome_label,
+    `Strata` = format_integer(observed_strata),
+    `Analysed N` = format_integer(analysed_n),
+    `Event %` = format_number(event_percent, 2),
+    `VPC A (%)` = format_number(vpc_model_a_percent, 2),
+    `VPC B (%)` = format_number(vpc_model_b_percent, 2),
+    `PCV (%)` = format_number(pcv_percent, 2),
+    `MOR A` = format_number(mor_model_a, 2),
+    `MOR B` = format_number(mor_model_b, 2),
+    `AUC additive` = format_number(auc_model_b_fixed, 3),
+    `AUC total` = format_number(auc_model_b_total, 3),
+    `Interactions (FDR)` = format_integer(n_distinguishable_fdr),
+    Status = ifelse(singular_model_b, "Model B variance at zero", "Estimated")
+  )
+
+word_fixed_effects <- fixed_effects_table %>%
+  transmute(
+    Specification = specification_label,
+    Outcome = outcome_label,
+    Variable = variable_label,
+    Level = level,
+    OR = ifelse(is_reference, "1.00 (ref)", format_number(odds_ratio, 2)),
+    `95% CI` = ifelse(
+      is_reference | is.na(confidence_low), "",
+      paste0(format_number(confidence_low, 2), " to ",
+             format_number(confidence_high, 2))
+    ),
+    `p` = format_p_value(p_value)
+  )
+
+word_extremes <- extremes_table %>%
+  transmute(
+    Specification = specification_label,
+    Outcome = outcome_label,
+    Extreme = extreme,
+    Stratum = condition_label,
+    `n` = format_integer(n),
+    Events = format_integer(events),
+    `Observed %` = format_number(100 * observed_probability, 2),
+    `Predicted %` = format_number(100 * total_probability, 2),
+    `95% CI` = paste0(format_number(100 * total_probability_low, 2), " to ",
+                      format_number(100 * total_probability_high, 2))
+  )
+
+word_significant <- if (nrow(significant_table) > 0L) {
+  significant_table %>%
+    transmute(
+      Specification = specification_label,
+      Outcome = outcome_label,
+      Stratum = condition_label,
+      `n` = format_integer(n),
+      `Additive %` = format_number(100 * additive_probability, 2),
+      `Total %` = format_number(100 * total_probability, 2),
+      `Difference (pp)` = format_number(
+        100 * interaction_probability_difference, 2
+      ),
+      `95% CI (pp)` = paste0(
+        format_number(100 * interaction_probability_difference_low, 2),
+        " to ",
+        format_number(100 * interaction_probability_difference_high, 2)
+      ),
+      `q` = format_p_value(interaction_q_value)
+    )
+} else {
+  data.frame(
+    Result = paste0(
+      "No stratum interaction was significant at FDR < ", FDR_LEVEL, "."
+    )
+  )
+}
+
+word_sensitivity <- if (nrow(sensitivity_table) > 0L) {
+  sensitivity_table %>%
+    transmute(
+      Specification = specification_label,
+      Outcome = outcome_label,
+      `Minimum n` = format_integer(min_stratum_n),
+      `Strata retained` = format_integer(strata_retained),
+      `Individuals retained %` = format_number(individuals_retained_percent, 1),
+      `Events retained %` = format_number(events_retained_percent, 1),
+      `VPC A (%)` = format_number(vpc_model_a_percent, 2),
+      `VPC B (%)` = format_number(vpc_model_b_percent, 2),
+      `PCV (%)` = format_number(pcv_percent, 2),
+      `MOR A` = format_number(mor_model_a, 2)
+    )
+} else {
+  NULL
+}
+
+cell_rule_note <- paste0(
+  "Strata with fewer than ", MIN_STRATUM_N, " individuals",
+  if (MIN_STRATUM_EVENTS > 0) {
+    paste0(", or fewer than ", MIN_STRATUM_EVENTS, " events,")
+  } else "",
+  " were excluded before model fitting."
+)
+
+axis_list_text <- paste(
+  display_name_for(SPECIFICATIONS[[1L]]$axes), collapse = ", "
+)
+
+word_tables <- list(
+  list(number = 1, title = "Cohort Characteristics",
+       data = word_cohort_characteristics,
+       note = paste0(
+         "Percentages are of the records with that variable observed. ",
+         "Intersectional strata are defined by ", axis_list_text,
+         ". Categories marked (ref) are the reference categories in Model B."
+       ),
+       filename = "Table_1_cohort_characteristics.docx", font_size = 9),
+  list(number = 2, title = "Outcome Frequencies",
+       data = word_outcome_counts,
+       note = "Percentages use all complete observations for each outcome, before the minimum cell size rule was applied.",
+       filename = "Table_2_outcome_frequencies.docx", font_size = 10),
+  list(number = 3, title = "Crude Event Rates by Category",
+       data = word_event_rates,
+       note = paste(
+         "Unadjusted event rates with Wilson score 95% confidence intervals.",
+         "The Wilson interval is used because several categories are small or",
+         "have low event counts, where the Wald interval performs poorly.",
+         "These are marginal rates and take no account of the other axes."
+       ),
+       filename = "Table_3_event_rates_by_category.docx", font_size = 7.5),
+  list(number = 4, title = "Intersectional Stratum Size Distribution",
+       data = word_stratum_distribution,
+       note = paste(
+         "Distribution of stratum sizes before the minimum cell size rule.",
+         "Empty strata are combinations that are possible in principle but",
+         "were not observed in the cohort."
+       ),
+       filename = "Table_4_stratum_size_distribution.docx", font_size = 9),
+  list(number = 5, title = "Stratum Retention Under the Minimum Cell Size Rule",
+       data = word_retention,
+       note = paste(
+         cell_rule_note,
+         "Zero-event strata were retained, because a stratum with no events is",
+         "an observation of low risk rather than missing information."
+       ),
+       filename = "Table_5_stratum_retention.docx", font_size = 8),
+  list(number = 6, title = "MAIHDA Model Summary",
+       data = word_model_metrics,
+       note = paste(
+         "VPC = variance partition coefficient; PCV = proportional change in",
+         "variance; MOR = median odds ratio; AUC = area under the receiver",
+         "operating characteristic curve; FDR = false discovery rate. Model A",
+         "is the null model and Model B contains additive main effects plus",
+         "the stratum random intercept. A Model B variance estimated at zero",
+         "indicates that additive main effects account for all between-stratum",
+         "variation, so no residual intersectional interaction was detected."
+       ),
+       filename = "Table_6_model_summary.docx", font_size = 8),
+  list(number = 7, title = "Additive Fixed Effects from Model B",
+       data = word_fixed_effects,
+       note = "OR = odds ratio; CI = confidence interval. Reference categories are shown explicitly with an odds ratio of 1.00.",
+       filename = "Table_7_fixed_effects.docx", font_size = 8),
+  list(number = 8, title = "Lowest- and Highest-Risk Intersectional Strata",
+       data = word_extremes,
+       note = paste0("The ", N_EXTREME,
+                     " lowest and highest Model B predicted-risk strata are shown for each analysis. ",
+                     cell_rule_note),
+       filename = "Table_8_extreme_strata.docx", font_size = 7.5),
+  list(number = 9,
+       title = "Intersectional Interaction Residuals Surviving FDR Correction",
+       data = word_significant,
+       note = paste0(
+         "Only strata significant after Benjamini-Hochberg correction across ",
+         "the strata within each analysis are shown, because several hundred ",
+         "strata are compared simultaneously and an uncorrected interval ",
+         "excluding zero is not on its own evidence of an interaction. ",
+         "Difference is the Model B total predicted probability minus its ",
+         "additive-only prediction, expressed in percentage points. q is the ",
+         "adjusted p value; all strata are reported with both the corrected ",
+         "and uncorrected flags in all_stratum_predictions.csv."
+       ),
+       filename = "Table_9_significant_interactions.docx", font_size = 7.5)
+)
+
+if (!is.null(word_sensitivity)) {
+  word_tables[[length(word_tables) + 1L]] <- list(
+    number = 10, title = "Sensitivity to the Minimum Cell Size Threshold",
+    data = word_sensitivity,
+    note = paste(
+      "Models A and B refitted at each candidate minimum stratum size for a",
+      "single outcome. A threshold that materially changes VPC or PCV while",
+      "retaining a similar share of the cohort indicates that the result is",
+      "sensitive to the trimming rule and should be reported as such."
+    ),
+    filename = "Table_10_minimum_cell_sensitivity.docx", font_size = 8
+  )
+}
+
+word_directory <- file.path(OUTPUT_ROOT, "tables", "word")
+for (table_definition in word_tables) {
+  status <- tryCatch({
+    write_apa_table_document(
+      path = file.path(word_directory, table_definition$filename),
+      table_number = table_definition$number,
+      table_title = table_definition$title,
+      table_data = table_definition$data,
+      table_note = table_definition$note,
+      font_size = table_definition$font_size
+    )
+    TRUE
+  }, error = function(condition) {
+    log_message("Could not write ", table_definition$filename, ": ",
+                conditionMessage(condition), level = "WARN")
+    FALSE
+  })
+}
+
+# A combined table book is convenient for review and submission preparation.
+tryCatch({
+  combined_word_document <- new_apa_table_document()
+  for (table_index in seq_along(word_tables)) {
+    table_definition <- word_tables[[table_index]]
+    combined_word_document <- add_apa_table(
+      combined_word_document,
+      table_definition$number, table_definition$title,
+      table_definition$data, table_definition$note,
+      add_page_break = table_index > 1L,
+      font_size = table_definition$font_size
+    )
+  }
+  combined_path <- file.path(word_directory, "MAIHDA_APA_tables.docx")
+  print(combined_word_document, target = combined_path)
+  register_output(combined_path)
+}, error = function(condition) {
+  log_message("Could not write the combined table book: ",
+              conditionMessage(condition), level = "WARN")
+})
+
+# =============================================================================
+# 12. CROSS-OUTCOME AND CROSS-SPECIFICATION FIGURES
+# =============================================================================
+
+metrics_long <- metrics_table %>%
+  select(specification_label, outcome_label,
+         vpc_model_a_percent, vpc_model_b_percent) %>%
+  pivot_longer(
+    cols = c(vpc_model_a_percent, vpc_model_b_percent),
+    names_to = "model", values_to = "vpc_percent"
+  ) %>%
+  mutate(
+    model = recode(
+      model,
+      vpc_model_a_percent = "Model A: null",
+      vpc_model_b_percent = "Model B: additive"
+    )
+  )
+
+p_vpc <- ggplot(
+  metrics_long,
+  aes(x = vpc_percent, y = reorder(outcome_label, vpc_percent),
+      colour = model, shape = specification_label)
+) +
+  geom_point(size = 2.5, position = position_dodge(width = 0.55)) +
+  facet_wrap(~ specification_label, scales = "free_y") +
+  scale_colour_manual(values = c(
+    "Model A: null" = colour_observed,
+    "Model B: additive" = colour_predicted
+  )) +
+  labs(
+    title = "A. Variance partition coefficients across outcomes",
+    x = "Latent-scale VPC (%)", y = NULL, colour = NULL, shape = NULL
+  ) + publication_theme + theme(legend.position = "bottom")
+
+auc_long <- metrics_table %>%
+  select(specification_label, outcome_label,
+         auc_model_a_total, auc_model_b_total, auc_model_b_fixed) %>%
+  pivot_longer(
+    cols = starts_with("auc_"), names_to = "prediction", values_to = "auc"
+  ) %>%
+  mutate(prediction = recode(
+    prediction,
+    auc_model_a_total = "Model A: stratum",
+    auc_model_b_total = "Model B: additive + interaction",
+    auc_model_b_fixed = "Model B: additive only"
+  ))
+
+p_auc <- ggplot(
+  auc_long,
+  aes(x = auc, y = reorder(outcome_label, auc), colour = prediction)
+) +
+  geom_vline(xintercept = 0.5, linetype = "dashed", colour = "grey55") +
+  geom_point(size = 2.3, position = position_dodge(width = 0.55)) +
+  facet_wrap(~ specification_label, scales = "free_y") +
+  scale_x_continuous(limits = c(0.5, 1), breaks = seq(0.5, 1, 0.1)) +
+  scale_colour_manual(values = c(
+    "Model A: stratum" = colour_observed,
+    "Model B: additive + interaction" = colour_predicted,
+    "Model B: additive only" = colour_interaction
+  )) +
+  labs(
+    title = "B. Discriminatory accuracy across outcomes",
+    x = "Area under the ROC curve", y = NULL, colour = NULL
+  ) + publication_theme + theme(legend.position = "bottom")
+
+p_pcv <- ggplot(
+  metrics_table,
+  aes(x = pcv_percent, y = reorder(outcome_label, pcv_percent),
+      colour = specification_label)
+) +
+  geom_vline(xintercept = 0, linewidth = 0.35, colour = "grey55") +
+  geom_point(size = 2.5) +
+  labs(
+    title = "C. Proportional change in between-stratum variance",
+    x = "PCV from Model A to Model B (%)", y = NULL, colour = NULL
+  ) + publication_theme
+
+mor_long <- metrics_table %>%
+  select(specification_label, outcome_label, mor_model_a, mor_model_b) %>%
+  pivot_longer(starts_with("mor_"), names_to = "model", values_to = "mor") %>%
+  mutate(model = recode(model,
+                        mor_model_a = "Model A: null",
+                        mor_model_b = "Model B: additive"))
+
+p_mor <- ggplot(
+  mor_long,
+  aes(x = mor, y = reorder(outcome_label, mor), colour = model,
+      shape = specification_label)
+) +
+  geom_vline(xintercept = 1, linewidth = 0.35, colour = "grey55") +
+  geom_point(size = 2.5, position = position_dodge(width = 0.55)) +
+  labs(
+    title = "D. Median odds ratios across outcomes",
+    x = "Median odds ratio", y = NULL, colour = NULL, shape = NULL
+  ) + publication_theme
+
+# The four panel-specific headings already identify the content clearly. An
+# additional overall heading competes for space once all twelve outcome labels
+# are present, so the combined version deliberately uses the panel headings.
+summary_multipanel <- (p_vpc | p_auc) / (p_pcv | p_mor)
+
+save_plot_pair(p_vpc,
+               file.path(OUTPUT_ROOT, "figures", "individual", "summary__vpc"),
+               width = 12, height = 8)
+save_plot_pair(p_auc,
+               file.path(OUTPUT_ROOT, "figures", "individual", "summary__auc"),
+               width = 12, height = 8)
+save_plot_pair(p_pcv,
+               file.path(OUTPUT_ROOT, "figures", "individual", "summary__pcv"),
+               width = 9, height = 7)
+save_plot_pair(p_mor,
+               file.path(OUTPUT_ROOT, "figures", "individual", "summary__mor"),
+               width = 10, height = 7)
+save_plot_pair(summary_multipanel,
+               file.path(OUTPUT_ROOT, "figures", "multipanel",
+                         "all_outcomes__summary"),
+               width = 18, height = 14)
+
+# --- Minimum cell size figures ----------------------------------------------
+# The trimming rule deserves its own visual account, because a reader's first
+# question about any trimmed intersectional analysis is what was removed.
+
+retention_long <- retention_table %>%
+  select(specification_label, outcome_label,
+         `Strata retained` = strata_retained_percent,
+         `Individuals retained` = individuals_retained_percent,
+         `Events retained` = events_retained_percent) %>%
+  pivot_longer(cols = c(`Strata retained`, `Individuals retained`,
+                        `Events retained`),
+               names_to = "quantity", values_to = "percent")
+
+p_retention <- ggplot(
+  retention_long,
+  aes(x = percent, y = reorder(outcome_label, percent), colour = quantity)
+) +
+  geom_point(size = 2.4, position = position_dodge(width = 0.55)) +
+  facet_wrap(~ specification_label, scales = "free_y") +
+  scale_x_continuous(limits = c(0, 100)) +
+  scale_colour_manual(values = c(
+    "Strata retained" = colour_interaction,
+    "Individuals retained" = colour_predicted,
+    "Events retained" = colour_observed
+  )) +
+  labs(
+    title = "Retention under the minimum cell size rule",
+    subtitle = cell_rule_note,
+    x = "Percentage retained", y = NULL, colour = NULL
+  ) + publication_theme
+
+save_plot_pair(p_retention,
+               file.path(OUTPUT_ROOT, "figures", "individual",
+                         "summary__stratum_retention"),
+               width = 12, height = 8)
+
+# --- Descriptive figures ----------------------------------------------------
+# Drawn here rather than in section 3B because the publication theme is defined
+# with the other figure code.
+
+# Levels are keyed by variable before being made a factor. Two axes can share a
+# category name -- "Other" appears in more than one classification -- and a
+# plain level factor would silently merge them across facets.
+LEVEL_KEY_SEPARATOR <- ""
+key_levels <- function(data) {
+  data %>%
+    mutate(
+      level_key = factor(
+        paste(variable, level, sep = LEVEL_KEY_SEPARATOR),
+        levels = rev(unique(paste(variable, level, sep = LEVEL_KEY_SEPARATOR)))
+      ),
+      # Facets follow the order the axes are declared in the specification,
+      # not alphabetical order, so every descriptive figure reads in the same
+      # sequence as the tables and the model output.
+      variable_label = factor(variable_label,
+                              levels = display_name_for(descriptive_axes))
+    )
+}
+strip_level_key <- function(x) {
+  sub(paste0(".*", LEVEL_KEY_SEPARATOR), "", x)
+}
+
+p_cohort <- ggplot(
+  key_levels(cohort_characteristics),
+  aes(x = percent, y = level_key, fill = is_reference)
+) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = format_integer(n)), hjust = -0.15, size = 3,
+            family = PLOT_FONT, colour = colour_charcoal) +
+  facet_wrap(~ variable_label, scales = "free_y", ncol = 2) +
+  scale_y_discrete(labels = strip_level_key) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18))) +
+  scale_fill_manual(values = c(`FALSE` = colour_predicted,
+                               `TRUE` = colour_interaction),
+                    labels = c(`FALSE` = "Category",
+                               `TRUE` = "Reference category"),
+                    drop = FALSE) +
+  labs(
+    title = "Cohort composition by stratum axis",
+    subtitle = paste0("N = ", format(nrow(analysis_master), big.mark = ","),
+                      "; bars show the percentage within each variable"),
+    x = "Percentage of cohort", y = NULL, fill = NULL
+  ) + publication_theme
+
+save_plot_pair(p_cohort,
+               file.path(OUTPUT_ROOT, "figures", "individual",
+                         "descriptive__cohort_composition"),
+               width = 11, height = 9)
+
+# The stratum size distribution is shown on a log scale because the counts span
+# several orders of magnitude and a linear axis would compress everything
+# except the largest strata into a single bar.
+p_stratum_sizes <- ggplot(descriptive_strata, aes(x = n)) +
+  geom_histogram(bins = 40, fill = colour_predicted, colour = "white",
+                 alpha = 0.85) +
+  geom_vline(xintercept = MIN_STRATUM_N, linetype = "dashed",
+             linewidth = 0.5, colour = unname(nature_colours["vermillion"])) +
+  scale_x_log10(labels = label_number(accuracy = 1)) +
+  facet_wrap(~ specification_label, scales = "free_y") +
+  labs(
+    title = "Distribution of intersectional stratum sizes",
+    subtitle = paste0(
+      "Dashed line marks the minimum cell size threshold (n = ",
+      MIN_STRATUM_N, "). Horizontal axis is on a log scale."
+    ),
+    x = "Stratum size (n)", y = "Number of strata"
+  ) + publication_theme
+
+save_plot_pair(p_stratum_sizes,
+               file.path(OUTPUT_ROOT, "figures", "individual",
+                         "descriptive__stratum_size_distribution"),
+               width = 10, height = 7)
+
+# Crude event rates give the reader the marginal picture the MAIHDA model is
+# then decomposing. Restricted to the composite outcomes so the panel stays
+# readable; the full set is in descriptive_event_rates_by_category.csv.
+headline_outcomes <- intersect(
+  c("event_365d_any", "event_90d_any"), names(OUTCOME_LABELS)
+)
+if (length(headline_outcomes) == 0L) {
+  headline_outcomes <- names(OUTCOME_LABELS)[1L]
+}
+
+p_event_rates <- ggplot(
+  key_levels(descriptive_event_rates %>%
+               filter(outcome %in% headline_outcomes)),
+  aes(x = event_percent, y = level_key, colour = outcome_label)
+) +
+  geom_errorbar(aes(xmin = ci_low_percent, xmax = ci_high_percent),
+                orientation = "y", width = 0, linewidth = 0.45,
+                position = position_dodge(width = 0.5)) +
+  geom_point(size = 2.2, position = position_dodge(width = 0.5)) +
+  facet_wrap(~ variable_label, scales = "free_y", ncol = 2) +
+  scale_y_discrete(labels = strip_level_key) +
+  scale_colour_manual(values = unname(
+    nature_colours[c("vermillion", "blue", "teal", "lavender")]
+  )[seq_along(headline_outcomes)]) +
+  labs(
+    title = "Crude event rates by category",
+    subtitle = "Unadjusted marginal rates with Wilson score 95% intervals",
+    x = "Event rate (%)", y = NULL, colour = NULL
+  ) + publication_theme
+
+save_plot_pair(p_event_rates,
+               file.path(OUTPUT_ROOT, "figures", "individual",
+                         "descriptive__event_rates_by_category"),
+               width = 11, height = 9)
+
+descriptive_multipanel <- (p_cohort | p_event_rates) / (p_stratum_sizes |
+                                                          p_retention)
+save_plot_pair(descriptive_multipanel,
+               file.path(OUTPUT_ROOT, "figures", "multipanel",
+                         "descriptives__summary"),
+               width = 20, height = 17)
+
+if (nrow(sensitivity_table) > 0L) {
+  sensitivity_long <- sensitivity_table %>%
+    filter(status == "fitted") %>%
+    select(specification_label, min_stratum_n,
+           `VPC A (%)` = vpc_model_a_percent,
+           `VPC B (%)` = vpc_model_b_percent,
+           `PCV (%)` = pcv_percent,
+           `Individuals retained (%)` = individuals_retained_percent) %>%
+    pivot_longer(cols = -c(specification_label, min_stratum_n),
+                 names_to = "quantity", values_to = "value")
+
+  if (nrow(sensitivity_long) > 0L) {
+    p_sensitivity <- ggplot(
+      sensitivity_long,
+      aes(x = min_stratum_n, y = value, colour = specification_label)
+    ) +
+      geom_line(linewidth = 0.5) +
+      geom_point(size = 1.8) +
+      geom_vline(xintercept = MIN_STRATUM_N, linetype = "dashed",
+                 linewidth = 0.4, colour = "grey45") +
+      facet_wrap(~ quantity, scales = "free_y") +
+      labs(
+        title = "Sensitivity to the minimum cell size threshold",
+        subtitle = paste0(
+          "Outcome: ", unname(OUTCOME_LABELS[SENSITIVITY_OUTCOME]),
+          ". The dashed line marks the threshold used in the main analysis (n >= ",
+          MIN_STRATUM_N, ")."
+        ),
+        x = "Minimum stratum size", y = NULL, colour = NULL
+      ) + publication_theme
+
+    save_plot_pair(p_sensitivity,
+                   file.path(OUTPUT_ROOT, "figures", "individual",
+                             "summary__minimum_cell_sensitivity"),
+                   width = 12, height = 8)
+  }
+}
+
+# =============================================================================
+# 13. RUN MANIFEST AND SESSION INFORMATION
+# =============================================================================
+
+elapsed_minutes <- as.numeric(
+  difftime(Sys.time(), RUN_STARTED_AT, units = "mins")
+)
+
+manifest <- data.frame(
+  field = c(
+    "input_file", "output_root", "test_mode", "n_specifications",
+    "n_outcomes", "n_analyses_attempted", "n_analyses_completed",
+    "n_analyses_failed", "min_stratum_n", "min_stratum_events",
+    "fdr_level", "nAGQ", "seed", "ggprism_available", "svg_written",
+    "plot_font", "elapsed_minutes", "r_version", "lme4_version",
+    "completed_at_utc"
+  ),
+  value = c(
+    DATA_PATH, OUTPUT_ROOT, TEST_MODE, length(SPECIFICATIONS),
+    length(OUTCOME_LABELS), total_analyses, completed_analyses,
+    nrow(failures_table), MIN_STRATUM_N, MIN_STRATUM_EVENTS,
+    FDR_LEVEL, N_AGQ, 20260814, HAS_GGPRISM, WRITE_SVG,
+    if (nzchar(PLOT_FONT)) PLOT_FONT else "device default",
+    formatC(elapsed_minutes, format = "f", digits = 1),
+    R.version.string, as.character(utils::packageVersion("lme4")),
+    format(Sys.time(), tz = "UTC")
+  )
+)
+write_csv_output(manifest, file.path(OUTPUT_ROOT, "tables",
+                                     "run_manifest.csv"))
+
+# The output manifest makes an incomplete run immediately obvious and gives
+# anyone reviewing the results a complete index of what was produced.
+existing_outputs <- unique(output_registry$paths)
+output_manifest <- data.frame(
+  file = sub(paste0("^", OUTPUT_ROOT, .Platform$file.sep), "", existing_outputs),
+  exists = file.exists(existing_outputs),
+  size_kb = round(file.size(existing_outputs) / 1024, 1)
+) %>%
+  arrange(file)
+write.csv(output_manifest,
+          file.path(OUTPUT_ROOT, "OUTPUT_MANIFEST.csv"), row.names = FALSE)
+
+capture.output(sessionInfo(),
+               file = file.path(OUTPUT_ROOT, "logs", "sessionInfo.txt"))
+
+singular_b <- metrics_table$outcome_label[metrics_table$singular_model_b]
+completion_lines <- c(
+  "MAIHDA analysis completed.",
+  paste("Input:", DATA_PATH),
+  paste("Output:", OUTPUT_ROOT),
+  paste("Specifications:", paste(names(SPECIFICATIONS), collapse = ", ")),
+  paste("Outcomes:", paste(names(OUTCOME_LABELS), collapse = ", ")),
+  paste("Analyses completed:", completed_analyses, "of", total_analyses),
+  paste("Analyses failed:", nrow(failures_table)),
+  paste0("Minimum cell rule: n >= ", MIN_STRATUM_N,
+         ", events >= ", MIN_STRATUM_EVENTS),
+  paste("Files written:", nrow(output_manifest)),
+  paste0("Elapsed: ", formatC(elapsed_minutes, format = "f", digits = 1),
+         " minutes"),
+  paste("Completed UTC:", format(Sys.time(), tz = "UTC"))
+)
+if (length(singular_b) > 0L) {
+  completion_lines <- c(
+    completion_lines, "",
+    "Model B variance estimated at zero for the following analyses.",
+    "This is a substantive result, not an error: additive main effects",
+    "account for all between-stratum variation and no residual",
+    "intersectional interaction was detected.",
+    paste0("  - ", singular_b)
+  )
+}
+writeLines(completion_lines,
+           con = file.path(OUTPUT_ROOT, "logs", "completion.txt"))
+
+for (line in completion_lines) log_message(line)
+if (nrow(failures_table) > 0L) {
+  log_message("Some analyses failed. See failed_analyses.csv.", level = "WARN")
+}
+log_message("Results written to: ", OUTPUT_ROOT)

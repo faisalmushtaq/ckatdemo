@@ -1,0 +1,7 @@
+# Analysis outputs and local working files
+work/
+maihda_outputs/
+*.rds
+.Rhistory
+.RData
+.Rproj.user/
