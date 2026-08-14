@@ -152,9 +152,65 @@ DATA_PATH <- Sys.getenv("MAIHDA_DATA_PATH", unset = "")
 # directory in which R is started.
 OUTPUT_ROOT <- Sys.getenv("MAIHDA_OUTPUT_ROOT", unset = "maihda_outputs")
 
-# The tutorial uses Laplace maximum-likelihood estimation. nAGQ = 1 requests
-# the standard Laplace approximation in glmer. Setting it to 0 is faster but is
-# a less accurate approximation and is therefore avoided for the main run.
+# --- Estimation engine ------------------------------------------------------
+# "bayesian" (default) fits the models with brms/Stan by Hamiltonian Monte
+# Carlo, following the Bayesian companion code to the Evans et al. tutorial.
+# "mle" fits them with lme4 by maximum likelihood.
+#
+# Bayesian is the default because it is what the tutorial's own R code uses for
+# the headline analysis, and because it resolves the one real weakness of the
+# maximum-likelihood route for this model class: under MLE there is no
+# straightforward way to obtain intervals for the derived quantities that
+# matter most here -- the VPC, the PCV, the total predicted risk per stratum,
+# and the absolute risk due to interaction on the probability scale. Those all
+# require propagating uncertainty through a nonlinear transform of both the
+# fixed and the random parts. The MLE route needs a zero-covariance assumption
+# and an approximation to get there; the posterior gives them directly and
+# exactly, as quantiles of draws.
+#
+# The MLE engine is retained deliberately. It is far faster, which makes it the
+# right choice while iterating, and it needs no C++ toolchain, which matters in
+# a locked-down environment where Stan may not be installable. Both engines
+# produce identical output columns, so every table, figure and generated
+# manuscript sentence works unchanged whichever is used. The engine used is
+# recorded in the metrics, the manifest and the generated Methods.
+ESTIMATION_ENGINE <- tolower(Sys.getenv("MAIHDA_ENGINE", unset = "bayesian"))
+if (!ESTIMATION_ENGINE %in% c("bayesian", "mle")) {
+  stop("MAIHDA_ENGINE must be \"bayesian\" or \"mle\", received: ",
+       ESTIMATION_ENGINE)
+}
+
+# MCMC settings. The defaults are those used in the tutorial's Bayesian code:
+# four chains of 2000 iterations with 1000 warmup.
+MCMC_CHAINS <- as.integer(env_number("MAIHDA_MCMC_CHAINS", 4))
+MCMC_ITERATIONS <- as.integer(env_number("MAIHDA_MCMC_ITER", 2000))
+MCMC_WARMUP <- as.integer(env_number("MAIHDA_MCMC_WARMUP", 1000))
+MCMC_SEED <- as.integer(env_number("MAIHDA_MCMC_SEED", 1))
+MCMC_CORES <- as.integer(env_number("MAIHDA_MCMC_CORES",
+                                    min(MCMC_CHAINS, parallel::detectCores())))
+# Raised from the Stan default of 0.8 because the funnel geometry of a
+# random-intercept model with many small groups is a classic source of
+# divergent transitions.
+MCMC_ADAPT_DELTA <- env_number("MAIHDA_MCMC_ADAPT_DELTA", 0.95)
+MCMC_MAX_TREEDEPTH <- as.integer(env_number("MAIHDA_MCMC_MAX_TREEDEPTH", 12))
+
+# Diagnostic thresholds. The tutorial asks for effective sample sizes above
+# 400 and, conventionally, R-hat below 1.01.
+MIN_EFFECTIVE_SAMPLE_SIZE <- env_number("MAIHDA_MIN_ESS", 400)
+MAX_RHAT <- env_number("MAIHDA_MAX_RHAT", 1.01)
+
+# The tutorial sets a normal(0, 1) prior on the fixed-effect coefficients of
+# the logistic additive model, because brms's default flat prior is a poor
+# choice on the logit scale: it places most of its mass near probabilities of
+# zero and one. Intercept and random-effect priors are left at the brms
+# defaults, which are weakly informative and sensible.
+PRIOR_FIXED_EFFECTS <- Sys.getenv("MAIHDA_PRIOR_FIXED", unset = "normal(0, 1)")
+
+# The tutorial uses posterior medians rather than means as point estimates.
+POSTERIOR_ROBUST <- env_flag("MAIHDA_POSTERIOR_ROBUST", default = TRUE)
+
+# Applies only to the MLE engine. nAGQ = 1 requests the standard Laplace
+# approximation in glmer; 0 is faster but less accurate.
 N_AGQ <- as.integer(env_number("MAIHDA_NAGQ", 1))
 
 # Set through MAIHDA_TEST_MODE=1 for a one-outcome validation run.
@@ -207,6 +263,15 @@ RUN_THRESHOLD_SENSITIVITY <- env_flag("MAIHDA_THRESHOLD_SENSITIVITY",
                                       default = TRUE)
 SENSITIVITY_THRESHOLDS <- c(0, 5, 10, 20, 30, 50)
 
+# The sweep exists to show that the trimming threshold does not drive the
+# conclusions, which is a question about the variance components rather than
+# about posterior uncertainty. It therefore always runs under maximum
+# likelihood, even when the main analysis is Bayesian: running it under MCMC
+# would multiply an overnight run by another six fits per specification for no
+# gain in what the sweep is actually establishing. This is stated in the
+# generated Methods.
+SENSITIVITY_ENGINE <- "mle"
+
 # --- Partially adjusted single-axis models ----------------------------------
 # An OPTIONAL EXTENSION, not part of the Evans et al. tutorial sequence.
 #
@@ -236,7 +301,12 @@ SENSITIVITY_THRESHOLDS <- c(0, 5, 10, 20, 30, 50)
 # One model is fitted per axis per outcome, so this multiplies the fitting work
 # by roughly the number of axes. It is the first thing to switch off when
 # iterating.
-RUN_AXIS_DECOMPOSITION <- env_flag("MAIHDA_AXIS_DECOMPOSITION", default = TRUE)
+# Default OFF under Bayesian estimation. It multiplies the number of models by
+# the number of axes, which under MCMC on a slow processor is hours of extra
+# work for a secondary output that the tutorial explicitly cautions against
+# over-reading. Under MLE it is cheap and stays on.
+RUN_AXIS_DECOMPOSITION <- env_flag("MAIHDA_AXIS_DECOMPOSITION",
+                                   default = ESTIMATION_ENGINE != "bayesian")
 
 # --- Uncertainty intervals for the variance components ----------------------
 # Published MAIHDA analyses report the VPC with an interval, which Bayesian
@@ -272,13 +342,41 @@ FDR_LEVEL <- env_number("MAIHDA_FDR_LEVEL", 0.05)
 # time and needs the svglite package. It degrades to PNG-only automatically.
 WRITE_SVG <- env_flag("MAIHDA_WRITE_SVG", default = TRUE)
 
-# Fitted glmer objects retain their model frames and are large. They are worth
-# keeping for a definitive run and not worth keeping while iterating.
-SAVE_MODELS <- env_flag("MAIHDA_SAVE_MODELS", default = TRUE)
+# Fitted model objects are large, and a brms fit carrying several thousand
+# posterior draws for every stratum is very much larger than a glmer fit. The
+# default is therefore OFF under Bayesian estimation: everything needed for
+# tables, figures and the manuscript is extracted to CSV before the object is
+# discarded, so keeping the fits is a convenience rather than a requirement.
+SAVE_MODELS <- env_flag("MAIHDA_SAVE_MODELS",
+                        default = ESTIMATION_ENGINE != "bayesian")
 
-# Skip an analysis whose metrics file already exists. Useful when a long run is
-# interrupted, and harmless otherwise.
-RESUME <- env_flag("MAIHDA_RESUME")
+# Skip an analysis whose metrics file already exists.
+#
+# The default is ON. A Bayesian run over many outcomes takes hours, and this
+# makes an interrupted run resumable simply by starting it again: completed
+# outcomes are skipped and the run picks up where it stopped. On a fresh output
+# directory it does nothing at all. Set MAIHDA_RESUME=0 to force everything to
+# be refitted.
+RESUME <- env_flag("MAIHDA_RESUME", default = TRUE)
+
+# --- Resource management for long unattended runs ---------------------------
+# Fitted models are discarded and the garbage collector is run after every
+# analysis, so peak memory is set by the single largest model rather than by
+# the number of outcomes. Trimming additionally drops the parts of a brms fit
+# that are not needed once the summaries have been extracted.
+TRIM_FITS <- env_flag("MAIHDA_TRIM_FITS", default = TRUE)
+
+# Stan compilation takes appreciable time on a slow processor and is pure
+# overhead when the same model structure is refitted for each outcome. When
+# enabled, the compiled Stan program from the first fit of each structure is
+# reused for every subsequent outcome, which removes one compilation per model
+# per outcome. It falls back to a fresh compile automatically if the design
+# matrix changes.
+REUSE_COMPILED_MODELS <- env_flag("MAIHDA_REUSE_COMPILED", default = TRUE)
+
+# Logged after each analysis so a run that is drifting towards trouble is
+# visible in the log rather than discovered when it stops.
+REPORT_MEMORY <- env_flag("MAIHDA_REPORT_MEMORY", default = TRUE)
 
 # Number of extreme strata retained at each end of the predicted-risk ranking.
 N_EXTREME <- as.integer(env_number("MAIHDA_N_EXTREME", 6))
@@ -390,18 +488,77 @@ required_packages <- c(
   "ggrepel", "officer", "flextable"
 )
 
-missing_packages <- required_packages[
-  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
-]
+if (ESTIMATION_ENGINE == "bayesian") {
+  required_packages <- c(required_packages, "brms", "rstan")
+}
+
+# Missing packages are installed automatically unless this is switched off.
+# In a trusted research environment there is often no route to CRAN, so the
+# failure has to be informative rather than a bare error: the script reports
+# precisely what is missing and how to obtain it.
+AUTO_INSTALL <- env_flag("MAIHDA_AUTO_INSTALL", default = TRUE)
+CRAN_MIRROR <- Sys.getenv("MAIHDA_CRAN_MIRROR",
+                          unset = "https://cloud.r-project.org")
+
+find_missing_packages <- function(packages) {
+  packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+}
+
+install_missing_packages <- function(packages, context) {
+  if (length(packages) == 0L) return(character(0))
+  message("Installing missing ", context, " packages: ",
+          paste(packages, collapse = ", "))
+  # A writable user library is created if the default library is read-only,
+  # which is the usual arrangement on a managed analysis machine.
+  library_path <- .libPaths()[1L]
+  if (file.access(library_path, mode = 2L) != 0L) {
+    library_path <- Sys.getenv("R_LIBS_USER",
+                               unset = file.path("~", "R", "library"))
+    library_path <- path.expand(library_path)
+    dir.create(library_path, recursive = TRUE, showWarnings = FALSE)
+    .libPaths(c(library_path, .libPaths()))
+    message("Default library is not writable; installing into ", library_path)
+  }
+  for (package in packages) {
+    try(
+      utils::install.packages(package, lib = library_path,
+                              repos = CRAN_MIRROR, quiet = TRUE),
+      silent = TRUE
+    )
+  }
+  find_missing_packages(packages)
+}
+
+missing_packages <- find_missing_packages(required_packages)
+if (length(missing_packages) > 0L && AUTO_INSTALL) {
+  missing_packages <- install_missing_packages(missing_packages, "required")
+}
 
 if (length(missing_packages) > 0L) {
   stop(
-    "Install the following packages before running this script: ",
+    "The following required packages are missing and could not be installed: ",
     paste(missing_packages, collapse = ", "),
-    "\nRun: install.packages(c(",
-    paste(sprintf("\"%s\"", missing_packages), collapse = ", "),
-    "))"
+    "\n\nIf this machine has no route to CRAN, install them from a local ",
+    "repository or transfer the sources, then run again. To install ",
+    "manually:\n  install.packages(c(",
+    paste(sprintf("\"%s\"", missing_packages), collapse = ", "), "))",
+    if ("brms" %in% missing_packages || "rstan" %in% missing_packages) {
+      paste0(
+        "\n\nbrms and rstan additionally need a working C++ toolchain and the ",
+        "BH, RcppEigen and StanHeaders packages. If Stan cannot be installed ",
+        "here, run with MAIHDA_ENGINE=mle to use maximum likelihood instead; ",
+        "all outputs are produced either way."
+      )
+    } else "",
+    "\n\nSet MAIHDA_AUTO_INSTALL=0 to disable automatic installation."
   )
+}
+
+# Optional packages improve the output but never block a run.
+optional_packages <- c("ggprism", "svglite", "systemfonts")
+missing_optional <- find_missing_packages(optional_packages)
+if (length(missing_optional) > 0L && AUTO_INSTALL) {
+  invisible(install_missing_packages(missing_optional, "optional"))
 }
 
 # Optional packages are detected rather than required, so that the absence of a
@@ -1108,6 +1265,230 @@ fit_glmer_robust <- function(model_formula, data, model_label) {
   )
 }
 
+# =============================================================================
+# 4B. BAYESIAN ESTIMATION ENGINE
+# =============================================================================
+# Follows the Bayesian companion code to the Evans et al. tutorial (brms/Stan,
+# adapted by Webb and Bell). Four things differ from the maximum-likelihood
+# route, and all four are improvements for this model class:
+#
+#   1. The VPC and PCV are computed from the posterior draws of the
+#      random-intercept standard deviation, so they carry credible intervals
+#      directly rather than needing a profile-likelihood approximation.
+#   2. The absolute risk and the absolute risk due to interaction are computed
+#      per draw on the probability scale and then summarised, so uncertainty is
+#      propagated exactly through the inverse-logit transform. The MLE route
+#      has to assume zero covariance between the fixed and random parts and
+#      approximate; here no such assumption is needed.
+#   3. Point estimates are posterior medians, as in the tutorial code.
+#   4. Convergence is a property to be checked rather than assumed, so R-hat,
+#      effective sample sizes and divergent transitions are recorded for every
+#      model and surfaced in the outputs.
+
+stan_environment_ready <- function() {
+  if (!requireNamespace("brms", quietly = TRUE)) {
+    return(list(ready = FALSE, reason = "the brms package is not installed"))
+  }
+  if (!requireNamespace("rstan", quietly = TRUE)) {
+    return(list(ready = FALSE, reason = "the rstan package is not installed"))
+  }
+  boost_include <- system.file("include", package = "BH")
+  if (!nzchar(boost_include)) {
+    return(list(
+      ready = FALSE,
+      reason = paste(
+        "the BH package provides no headers, so Stan cannot compile.",
+        "Install the CRAN BH package (not a distribution shim)"
+      )
+    ))
+  }
+  list(ready = TRUE, reason = "")
+}
+
+if (ESTIMATION_ENGINE == "bayesian") {
+  stan_status <- stan_environment_ready()
+  if (!stan_status$ready) {
+    stop(
+      "Bayesian estimation was requested but the Stan toolchain is not usable: ",
+      stan_status$reason, ".\n",
+      "Either install a working brms/rstan toolchain, or run with ",
+      "MAIHDA_ENGINE=mle to use maximum likelihood instead. The MLE engine ",
+      "produces the same outputs; see the script header for what differs."
+    )
+  }
+  suppressPackageStartupMessages(library(brms))
+  options(mc.cores = MCMC_CORES)
+}
+
+# Compiled Stan programs are cached by model structure and reused across
+# outcomes. Compilation is a fixed cost of roughly a minute per structure, and
+# on a slow processor paying it once per outcome rather than once per structure
+# is a substantial and entirely avoidable waste.
+compiled_model_cache <- new.env(parent = emptyenv())
+
+# The tutorial leaves the intercept and random-effect priors at the brms
+# defaults, which are weakly informative, and replaces the default flat prior
+# on the fixed-effect coefficients with normal(0, 1). A flat prior on the logit
+# scale is a poor choice: transformed to the probability scale it concentrates
+# its mass near zero and one.
+build_model_priors <- function(model_formula, data) {
+  default_priors <- brms::get_prior(model_formula, data = data)
+  has_fixed_effects <- any(default_priors$class == "b")
+  if (!has_fixed_effects || !nzchar(PRIOR_FIXED_EFFECTS)) return(default_priors)
+  default_priors$prior[default_priors$class == "b"] <- PRIOR_FIXED_EFFECTS
+  default_priors
+}
+
+# Divergent transitions indicate the sampler could not explore the posterior
+# geometry properly and that the estimates may be biased. They are counted
+# rather than ignored.
+count_divergent_transitions <- function(model) {
+  sampler_parameters <- tryCatch(
+    rstan::get_sampler_params(model$fit, inc_warmup = FALSE),
+    error = function(condition) NULL
+  )
+  if (is.null(sampler_parameters)) return(NA_integer_)
+  sum(vapply(sampler_parameters,
+             function(chain) sum(chain[, "divergent__"]), numeric(1)))
+}
+
+brms_diagnostics <- function(model, label) {
+  summary_table <- tryCatch(
+    suppressWarnings(brms::posterior_summary(model)),
+    error = function(condition) NULL
+  )
+  rhat_values <- tryCatch(suppressWarnings(brms::rhat(model)),
+                          error = function(condition) NA_real_)
+  ess_bulk <- tryCatch(
+    suppressWarnings(summary(model)$fixed[, "Bulk_ESS"]),
+    error = function(condition) NA_real_
+  )
+  ess_random <- tryCatch(
+    suppressWarnings(summary(model)$random$stratum[, "Bulk_ESS"]),
+    error = function(condition) NA_real_
+  )
+  list(
+    max_rhat = suppressWarnings(max(rhat_values, na.rm = TRUE)),
+    min_ess = suppressWarnings(min(c(ess_bulk, ess_random), na.rm = TRUE)),
+    divergent_transitions = count_divergent_transitions(model),
+    label = label
+  )
+}
+
+# Fits a brms model, reusing a previously compiled Stan program for the same
+# model structure where possible. If the design matrix has changed -- which
+# happens when trimming removes a whole category for one outcome but not
+# another -- the reuse fails and a fresh compile is done automatically.
+fit_brms_model <- function(model_formula, data, cache_key, label) {
+  cached <- if (REUSE_COMPILED_MODELS && exists(cache_key,
+                                                envir = compiled_model_cache)) {
+    get(cache_key, envir = compiled_model_cache)
+  } else {
+    NULL
+  }
+
+  fitted_model <- NULL
+  if (!is.null(cached)) {
+    fitted_model <- tryCatch(
+      suppressMessages(suppressWarnings(
+        stats::update(cached, newdata = data, recompile = FALSE,
+                      chains = MCMC_CHAINS, iter = MCMC_ITERATIONS,
+                      warmup = MCMC_WARMUP, cores = MCMC_CORES,
+                      seed = MCMC_SEED, refresh = 0,
+                      control = list(adapt_delta = MCMC_ADAPT_DELTA,
+                                     max_treedepth = MCMC_MAX_TREEDEPTH))
+      )),
+      error = function(condition) {
+        log_message("    Compiled model could not be reused for ", label,
+                    " (", conditionMessage(condition),
+                    "); recompiling.", level = "NOTE")
+        NULL
+      }
+    )
+  }
+
+  if (is.null(fitted_model)) {
+    priors <- build_model_priors(model_formula, data)
+    fitted_model <- suppressMessages(suppressWarnings(
+      brms::brm(
+        formula = model_formula, data = data, prior = priors,
+        chains = MCMC_CHAINS, iter = MCMC_ITERATIONS, warmup = MCMC_WARMUP,
+        cores = MCMC_CORES, seed = MCMC_SEED, refresh = 0,
+        control = list(adapt_delta = MCMC_ADAPT_DELTA,
+                       max_treedepth = MCMC_MAX_TREEDEPTH)
+      )
+    ))
+    if (REUSE_COMPILED_MODELS) {
+      assign(cache_key, fitted_model, envir = compiled_model_cache)
+    }
+  }
+  fitted_model
+}
+
+# Posterior draws of the between-stratum standard deviation. Everything the
+# variance summaries need is derived from this one vector, which keeps the
+# memory footprint small: the alternative, holding the full draws data frame,
+# is orders of magnitude larger and is not needed.
+stratum_sd_draws <- function(model) {
+  draws <- tryCatch(
+    as.matrix(model, variable = "sd_stratum__Intercept"),
+    error = function(condition) NULL
+  )
+  if (is.null(draws) || ncol(draws) == 0L) return(numeric(0))
+  as.numeric(draws[, 1L])
+}
+
+posterior_point <- function(x) {
+  if (POSTERIOR_ROBUST) stats::median(x) else mean(x)
+}
+
+# VPC, MOR and the variance itself, each summarised from the same draws so the
+# point estimates and intervals are mutually consistent.
+bayesian_variance_summary <- function(sd_draws) {
+  if (length(sd_draws) == 0L) {
+    return(list(variance = NA_real_, variance_low = NA_real_,
+                variance_high = NA_real_, vpc = NA_real_, vpc_low = NA_real_,
+                vpc_high = NA_real_, mor = NA_real_, mor_low = NA_real_,
+                mor_high = NA_real_))
+  }
+  variance_draws <- sd_draws^2
+  vpc_draws <- 100 * logistic_vpc(variance_draws)
+  mor_draws <- median_odds_ratio(variance_draws)
+  quantiles <- function(x) unname(stats::quantile(x, c(0.025, 0.975)))
+  list(
+    variance = posterior_point(variance_draws),
+    variance_low = quantiles(variance_draws)[1L],
+    variance_high = quantiles(variance_draws)[2L],
+    vpc = posterior_point(vpc_draws),
+    vpc_low = quantiles(vpc_draws)[1L],
+    vpc_high = quantiles(vpc_draws)[2L],
+    mor = posterior_point(mor_draws),
+    mor_low = quantiles(mor_draws)[1L],
+    mor_high = quantiles(mor_draws)[2L]
+  )
+}
+
+# The PCV is formed draw by draw from the two models, so its credible interval
+# reflects uncertainty in both variances rather than being a point calculation
+# on two summaries. Chains are matched by draw index, exactly as in the
+# tutorial code.
+bayesian_pcv_summary <- function(sd_draws_a, sd_draws_b) {
+  n_draws <- min(length(sd_draws_a), length(sd_draws_b))
+  if (n_draws == 0L) {
+    return(list(pcv = NA_real_, pcv_low = NA_real_, pcv_high = NA_real_))
+  }
+  variance_a <- sd_draws_a[seq_len(n_draws)]^2
+  variance_b <- sd_draws_b[seq_len(n_draws)]^2
+  pcv_draws <- 100 * (variance_a - variance_b) / variance_a
+  pcv_draws <- pcv_draws[is.finite(pcv_draws)]
+  if (length(pcv_draws) == 0L) {
+    return(list(pcv = NA_real_, pcv_low = NA_real_, pcv_high = NA_real_))
+  }
+  quantiles <- unname(stats::quantile(pcv_draws, c(0.025, 0.975)))
+  list(pcv = posterior_point(pcv_draws), pcv_low = quantiles[1L],
+       pcv_high = quantiles[2L])
+}
+
 # --- Fixed effects ----------------------------------------------------------
 # Model terms are decomposed into variable and level, and the omitted reference
 # categories are reinstated as explicit rows. A fixed-effects table that simply
@@ -1322,6 +1703,196 @@ make_stratum_predictions <- function(model_a, model_b, strata_data,
       interaction_distinguishable, interaction_distinguishable_fdr,
       prediction_rank, interaction_rank
     )
+}
+
+# Stratum predictions from the posterior. Returns exactly the same columns as
+# the maximum-likelihood version, so every downstream table, figure and
+# manuscript sentence is indifferent to which engine produced them.
+#
+# The key difference is that the absolute risk and the absolute risk due to
+# interaction are formed on the probability scale within each draw and only
+# then summarised. This is what the tutorial's Bayesian code does, and it is
+# why the Bayesian route needs no zero-covariance assumption: the joint
+# uncertainty in the fixed and random parts is already carried by the draws.
+make_stratum_predictions_bayesian <- function(model_a, model_b, strata_data,
+                                              axes, specification,
+                                              specification_label,
+                                              outcome, outcome_label) {
+  # Linear predictors on the log-odds scale, as draws x strata matrices.
+  # posterior_linpred is used rather than posterior_epred because for a
+  # binomial model with trials(n) the expectation is a count, not a
+  # probability.
+  linear_total_b <- brms::posterior_linpred(model_b, newdata = strata_data,
+                                            re_formula = NULL)
+  linear_fixed_b <- brms::posterior_linpred(model_b, newdata = strata_data,
+                                            re_formula = NA)
+  linear_total_a <- brms::posterior_linpred(model_a, newdata = strata_data,
+                                            re_formula = NULL)
+  linear_fixed_a <- brms::posterior_linpred(model_a, newdata = strata_data,
+                                            re_formula = NA)
+
+  probability_total <- inv_logit(linear_total_b)
+  probability_fixed <- inv_logit(linear_fixed_b)
+  # The absolute risk due to interaction, per draw.
+  ari_draws <- probability_total - probability_fixed
+  # The interaction residual on the log-odds scale, per draw.
+  residual_draws <- linear_total_b - linear_fixed_b
+
+  summarise_columns <- function(draws, point = TRUE) {
+    centre <- if (point) {
+      if (POSTERIOR_ROBUST) apply(draws, 2L, stats::median) else colMeans(draws)
+    } else NULL
+    lower <- apply(draws, 2L, stats::quantile, probs = 0.025)
+    upper <- apply(draws, 2L, stats::quantile, probs = 0.975)
+    list(centre = centre, lower = unname(lower), upper = unname(upper))
+  }
+
+  total_summary <- summarise_columns(probability_total)
+  additive_summary <- summarise_columns(probability_fixed)
+  ari_summary <- summarise_columns(ari_draws)
+  residual_summary <- summarise_columns(residual_draws)
+  null_total_summary <- summarise_columns(inv_logit(linear_total_a))
+  null_fixed_summary <- summarise_columns(inv_logit(linear_fixed_a))
+
+  # The Bayesian analogue of a two-sided significance test is the probability
+  # of direction: the posterior probability that the effect has the sign of its
+  # point estimate. It is reported directly, and is additionally mapped to a
+  # two-sided pseudo p-value so that the same false discovery rate machinery
+  # can be applied as under maximum likelihood, keeping the two engines
+  # comparable.
+  probability_of_direction <- apply(residual_draws, 2L, function(column) {
+    max(mean(column > 0), mean(column < 0))
+  })
+  pseudo_p_value <- 2 * (1 - probability_of_direction)
+
+  # Free the large matrices before assembling the output frame.
+  rm(linear_total_b, linear_fixed_b, linear_total_a, linear_fixed_a,
+     probability_total, probability_fixed, ari_draws, residual_draws)
+  invisible(gc(verbose = FALSE))
+
+  prediction <- strata_data %>%
+    mutate(
+      specification = specification,
+      specification_label = specification_label,
+      outcome = outcome,
+      outcome_label = outcome_label,
+      observed_probability = events / n,
+      null_fixed_probability = null_fixed_summary$centre,
+      null_total_probability = null_total_summary$centre,
+      additive_probability = additive_summary$centre,
+      total_probability = total_summary$centre,
+      total_probability_low = total_summary$lower,
+      total_probability_high = total_summary$upper,
+      interaction_log_odds = residual_summary$centre,
+      interaction_log_odds_se = (residual_summary$upper -
+                                   residual_summary$lower) / (2 * 1.96),
+      interaction_log_odds_low = residual_summary$lower,
+      interaction_log_odds_high = residual_summary$upper,
+      interaction_probability_difference = ari_summary$centre,
+      interaction_probability_difference_low = ari_summary$lower,
+      interaction_probability_difference_high = ari_summary$upper,
+      absolute_risk = total_probability,
+      absolute_risk_due_to_interaction = interaction_probability_difference,
+      interaction_probability_of_direction = probability_of_direction,
+      interaction_z = NA_real_,
+      interaction_p_value = pseudo_p_value,
+      # The canonical criterion in the tutorial: the 95% credible interval for
+      # the stratum random effect excludes zero.
+      interaction_distinguishable =
+        interaction_log_odds_low > 0 | interaction_log_odds_high < 0,
+      prediction_rank = rank(total_probability, ties.method = "first"),
+      interaction_rank = rank(interaction_probability_difference,
+                              ties.method = "first")
+    )
+
+  prediction$interaction_q_value <- p.adjust(prediction$interaction_p_value,
+                                             method = "BH")
+  prediction$interaction_distinguishable_fdr <-
+    !is.na(prediction$interaction_q_value) &
+    prediction$interaction_q_value < FDR_LEVEL
+
+  prediction %>%
+    select(
+      specification, specification_label, outcome, outcome_label,
+      all_of(axes), stratum, n, events, non_events,
+      observed_probability, null_fixed_probability, null_total_probability,
+      additive_probability, total_probability, total_probability_low,
+      total_probability_high, interaction_log_odds, interaction_log_odds_se,
+      interaction_log_odds_low, interaction_log_odds_high,
+      interaction_probability_difference,
+      interaction_probability_difference_low,
+      interaction_probability_difference_high,
+      absolute_risk, absolute_risk_due_to_interaction,
+      interaction_probability_of_direction,
+      interaction_z, interaction_p_value, interaction_q_value,
+      interaction_distinguishable, interaction_distinguishable_fdr,
+      prediction_rank, interaction_rank
+    )
+}
+
+# Fixed effects from a brms fit, presented in the same shape as the maximum
+# likelihood version. Credible intervals replace confidence intervals and the
+# p-value column is left empty, since a posterior has no such quantity.
+extract_fixed_effects_bayesian <- function(model, strata, axes, specification,
+                                           specification_label, outcome,
+                                           outcome_label) {
+  summary_table <- as.data.frame(brms::fixef(model, robust = POSTERIOR_ROBUST,
+                                             probs = c(0.025, 0.975)))
+  summary_table$term <- rownames(summary_table)
+  rownames(summary_table) <- NULL
+  names(summary_table)[1:4] <- c("estimate_log_odds", "standard_error",
+                                 "confidence_low_logit", "confidence_high_logit")
+
+  # brms strips non-syntactic characters from term names; align them back to
+  # the model matrix naming so the axis and level lookup matches.
+  lookup <- build_term_lookup(strata, axes)
+  lookup$term_clean <- make.names(lookup$term)
+  summary_table$term_clean <- make.names(summary_table$term)
+
+  estimated <- summary_table %>%
+    left_join(lookup %>% select(-term), by = "term_clean") %>%
+    mutate(
+      odds_ratio = exp(estimate_log_odds),
+      confidence_low = exp(confidence_low_logit),
+      confidence_high = exp(confidence_high_logit),
+      p_value = NA_real_,
+      z_value = NA_real_,
+      is_reference = ifelse(is.na(is_reference), FALSE, is_reference)
+    )
+
+  reference_rows <- lookup %>%
+    filter(is_reference, !term_clean %in% estimated$term_clean) %>%
+    mutate(
+      estimate_log_odds = 0, standard_error = NA_real_, z_value = NA_real_,
+      p_value = NA_real_, odds_ratio = 1, confidence_low = NA_real_,
+      confidence_high = NA_real_
+    ) %>%
+    rename(term_original = term)
+
+  bind_rows(
+    estimated,
+    reference_rows %>% mutate(term = term_original) %>% select(-term_original)
+  ) %>%
+    mutate(
+      specification = specification,
+      specification_label = specification_label,
+      outcome = outcome,
+      outcome_label = outcome_label,
+      term = ifelse(is.na(term), term_clean, term),
+      term_status = case_when(
+        is_reference ~ "reference",
+        is.na(standard_error) ~ "not estimated",
+        TRUE ~ "estimated"
+      ),
+      variable = ifelse(is.na(variable), term, variable),
+      variable_label = ifelse(is.na(variable_label), term, variable_label),
+      level = ifelse(is.na(level), "", level)
+    ) %>%
+    arrange(match(variable, c("(Intercept)", axes)), match(level, level)) %>%
+    select(specification, specification_label, outcome, outcome_label,
+           term, variable, variable_label, level, term_status, is_reference,
+           estimate_log_odds, standard_error, z_value, p_value,
+           odds_ratio, confidence_low, confidence_high)
 }
 
 # =============================================================================
@@ -1594,28 +2165,133 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
               " (", nrow(strata), " strata, ", sum(strata$n), " individuals)")
 
   formulae <- build_model_formulae(model_axes)
+  model_start_time <- Sys.time()
 
-  fit_a <- fit_glmer_robust(formulae$a, strata, paste0(outcome, " / Model A"))
-  fit_b <- fit_glmer_robust(formulae$b, strata, paste0(outcome, " / Model B"))
-  model_a <- fit_a$model
-  model_b <- fit_b$model
+  if (ESTIMATION_ENGINE == "bayesian") {
+    bayes_formula_a <- brms::brmsformula(
+      events | trials(n) ~ 1 + (1 | stratum), family = binomial("logit")
+    )
+    bayes_formula_b <- if (length(model_axes) == 0L) {
+      bayes_formula_a
+    } else {
+      brms::brmsformula(
+        as.formula(paste("events | trials(n) ~",
+                         paste(model_axes, collapse = " + "),
+                         "+ (1 | stratum)")),
+        family = binomial("logit")
+      )
+    }
 
-  variance_a <- random_intercept_variance(model_a)
-  variance_b <- random_intercept_variance(model_b)
-  pcv <- if (is.finite(variance_a) && variance_a > 0) {
-    100 * (variance_a - variance_b) / variance_a
+    model_a <- fit_brms_model(bayes_formula_a, strata, "null_model",
+                              paste0(outcome, " / Model A"))
+    diagnostics_a <- brms_diagnostics(model_a, "A")
+    sd_draws_a <- stratum_sd_draws(model_a)
+
+    model_b <- fit_brms_model(bayes_formula_b, strata, "additive_model",
+                              paste0(outcome, " / Model B"))
+    diagnostics_b <- brms_diagnostics(model_b, "B")
+    sd_draws_b <- stratum_sd_draws(model_b)
+
+    summary_a <- bayesian_variance_summary(sd_draws_a)
+    summary_b <- bayesian_variance_summary(sd_draws_b)
+    pcv_summary <- bayesian_pcv_summary(sd_draws_a, sd_draws_b)
+
+    variance_a <- summary_a$variance
+    variance_b <- summary_b$variance
+    pcv <- pcv_summary$pcv
+
+    interval_a <- list(
+      variance_low = summary_a$variance_low,
+      variance_high = summary_a$variance_high,
+      vpc_low = summary_a$vpc_low, vpc_high = summary_a$vpc_high,
+      mor_low = summary_a$mor_low, mor_high = summary_a$mor_high,
+      interval_method = "posterior credible interval"
+    )
+    interval_b <- list(
+      variance_low = summary_b$variance_low,
+      variance_high = summary_b$variance_high,
+      vpc_low = summary_b$vpc_low, vpc_high = summary_b$vpc_high,
+      mor_low = summary_b$mor_low, mor_high = summary_b$mor_high,
+      interval_method = "posterior credible interval"
+    )
+
+    # Convergence is reported rather than assumed. A model that fails these
+    # checks still produces output, but the failure is recorded in the metrics
+    # and logged so it cannot pass unnoticed.
+    for (diagnostics in list(diagnostics_a, diagnostics_b)) {
+      if (!is.na(diagnostics$max_rhat) && diagnostics$max_rhat > MAX_RHAT) {
+        log_message("    Model ", diagnostics$label, " R-hat is ",
+                    formatC(diagnostics$max_rhat, format = "f", digits = 3),
+                    ", above the ", MAX_RHAT, " threshold. Consider raising ",
+                    "MAIHDA_MCMC_ITER.", level = "WARN")
+      }
+      if (!is.na(diagnostics$min_ess) &&
+          diagnostics$min_ess < MIN_EFFECTIVE_SAMPLE_SIZE) {
+        log_message("    Model ", diagnostics$label,
+                    " minimum effective sample size is ",
+                    round(diagnostics$min_ess), ", below the ",
+                    MIN_EFFECTIVE_SAMPLE_SIZE, " threshold. Consider raising ",
+                    "MAIHDA_MCMC_ITER.", level = "WARN")
+      }
+      if (!is.na(diagnostics$divergent_transitions) &&
+          diagnostics$divergent_transitions > 0) {
+        log_message("    Model ", diagnostics$label, " had ",
+                    diagnostics$divergent_transitions,
+                    " divergent transitions. Consider raising ",
+                    "MAIHDA_MCMC_ADAPT_DELTA.", level = "WARN")
+      }
+    }
+    rm(sd_draws_a, sd_draws_b)
   } else {
-    NA_real_
+    fit_a <- fit_glmer_robust(formulae$a, strata, paste0(outcome, " / Model A"))
+    fit_b <- fit_glmer_robust(formulae$b, strata, paste0(outcome, " / Model B"))
+    model_a <- fit_a$model
+    model_b <- fit_b$model
+
+    variance_a <- random_intercept_variance(model_a)
+    variance_b <- random_intercept_variance(model_b)
+    pcv <- if (is.finite(variance_a) && variance_a > 0) {
+      100 * (variance_a - variance_b) / variance_a
+    } else {
+      NA_real_
+    }
+    interval_a <- variance_interval(model_a)
+    interval_b <- variance_interval(model_b)
+    diagnostics_a <- list(max_rhat = NA_real_, min_ess = NA_real_,
+                          divergent_transitions = NA_integer_)
+    diagnostics_b <- diagnostics_a
+    pcv_summary <- list(pcv = pcv, pcv_low = NA_real_, pcv_high = NA_real_)
+    summary_a <- list(vpc = 100 * logistic_vpc(variance_a),
+                      mor = median_odds_ratio(variance_a))
+    summary_b <- list(vpc = 100 * logistic_vpc(variance_b),
+                      mor = median_odds_ratio(variance_b))
   }
 
-  # Singularity is reported with its interpretation attached. A zero variance
-  # in Model B is a finding; a zero variance in Model A is a problem.
-  if (fit_a$singular) {
+  # Under MCMC there is no boundary solution to report: the variance is a
+  # posterior distribution bounded below by zero. The equivalent finding is a
+  # credible interval whose lower limit sits essentially at zero, which is
+  # reported here in the same interpretive terms.
+  if (ESTIMATION_ENGINE == "bayesian") {
+    if (!is.na(interval_b$vpc_high) && interval_b$vpc_high < 1) {
+      log_message("    Model B between-stratum variance is close to zero ",
+                  "(VPC 95% CrI up to ",
+                  formatC(interval_b$vpc_high, format = "f", digits = 2),
+                  "%). The additive main effects account for essentially all ",
+                  "between-stratum variation, so little residual ",
+                  "intersectional interaction is detectable.", level = "NOTE")
+    }
+    if (!is.na(interval_a$vpc_high) && interval_a$vpc_high < 1) {
+      log_message("    Model A between-stratum variance is close to zero. ",
+                  "This implies almost no detectable between-stratum ",
+                  "variation and should be investigated before the results ",
+                  "are used.", level = "WARN")
+    }
+  } else if (fit_a$singular) {
     log_message("    Model A variance is at the zero boundary. This implies no ",
                 "detectable between-stratum variation and should be ",
                 "investigated before the results are used.", level = "WARN")
   }
-  if (fit_b$singular) {
+  if (ESTIMATION_ENGINE != "bayesian" && fit_b$singular) {
     log_message("    Model B variance is at the zero boundary",
                 if (fit_b$boundary_confirmed) {
                   " (confirmed across all optimisers)"
@@ -1627,9 +2303,6 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
                 "interaction is detected. PCV is at or near 100%.",
                 level = "NOTE")
   }
-
-  interval_a <- variance_interval(model_a)
-  interval_b <- variance_interval(model_b)
 
   axis_decomposition <- fit_axis_decomposition(
     strata, model_axes, variance_a, specification, specification_label,
@@ -1645,10 +2318,17 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
                 "%)")
   }
 
-  predictions <- make_stratum_predictions(
-    model_a, model_b, strata, axes, specification, specification_label,
-    outcome, outcome_label
-  )
+  predictions <- if (ESTIMATION_ENGINE == "bayesian") {
+    make_stratum_predictions_bayesian(
+      model_a, model_b, strata, axes, specification, specification_label,
+      outcome, outcome_label
+    )
+  } else {
+    make_stratum_predictions(
+      model_a, model_b, strata, axes, specification, specification_label,
+      outcome, outcome_label
+    )
+  }
 
   # AUC is computed from the prediction frame itself so that it cannot be
   # invalidated by a change in row ordering elsewhere.
@@ -1689,6 +2369,8 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     vpc_model_b_low = interval_b$vpc_low,
     vpc_model_b_high = interval_b$vpc_high,
     pcv_percent = pcv,
+    pcv_low = pcv_summary$pcv_low,
+    pcv_high = pcv_summary$pcv_high,
     mor_model_a = median_odds_ratio(variance_a),
     mor_model_a_low = interval_a$mor_low,
     mor_model_a_high = interval_a$mor_high,
@@ -1698,10 +2380,10 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     auc_model_a_fixed = auc_for("null_fixed_probability"),
     auc_model_b_total = auc_for("total_probability"),
     auc_model_b_fixed = auc_for("additive_probability"),
-    log_likelihood_model_a = as.numeric(logLik(model_a)),
-    log_likelihood_model_b = as.numeric(logLik(model_b)),
-    aic_model_a = AIC(model_a),
-    aic_model_b = AIC(model_b),
+    log_likelihood_model_a = if (ESTIMATION_ENGINE == "bayesian") NA_real_ else as.numeric(logLik(model_a)),
+    log_likelihood_model_b = if (ESTIMATION_ENGINE == "bayesian") NA_real_ else as.numeric(logLik(model_b)),
+    aic_model_a = if (ESTIMATION_ENGINE == "bayesian") NA_real_ else AIC(model_a),
+    aic_model_b = if (ESTIMATION_ENGINE == "bayesian") NA_real_ else AIC(model_b),
     n_distinguishable = sum(predictions$interaction_distinguishable),
     n_distinguishable_fdr = sum(predictions$interaction_distinguishable_fdr),
     # The ratio of the extremes is how the applied MAIHDA literature conveys
@@ -1715,29 +2397,65 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     absolute_risk_ratio = if (min(predictions$total_probability) > 0) {
       max(predictions$total_probability) / min(predictions$total_probability)
     } else NA_real_,
-    optimizer_model_a = fit_a$optimizer,
-    optimizer_model_b = fit_b$optimizer,
-    singular_model_a = fit_a$singular,
-    singular_model_b = fit_b$singular,
-    boundary_confirmed_model_a = fit_a$boundary_confirmed,
-    boundary_confirmed_model_b = fit_b$boundary_confirmed,
-    convergence_model_a = extract_convergence_message(model_a),
-    convergence_model_b = extract_convergence_message(model_b),
+    estimation_engine = ESTIMATION_ENGINE,
+    optimizer_model_a = if (ESTIMATION_ENGINE == "bayesian") "stan/hmc" else fit_a$optimizer,
+    optimizer_model_b = if (ESTIMATION_ENGINE == "bayesian") "stan/hmc" else fit_b$optimizer,
+    # Under MCMC there is no boundary solution to detect: a variance is a
+    # posterior distribution bounded below by zero, not a point estimate that
+    # can sit exactly on the bound. The singular flags are therefore FALSE and
+    # the near-zero case is conveyed by the credible interval instead.
+    singular_model_a = if (ESTIMATION_ENGINE == "bayesian") FALSE else fit_a$singular,
+    singular_model_b = if (ESTIMATION_ENGINE == "bayesian") FALSE else fit_b$singular,
+    boundary_confirmed_model_a = if (ESTIMATION_ENGINE == "bayesian") NA else fit_a$boundary_confirmed,
+    boundary_confirmed_model_b = if (ESTIMATION_ENGINE == "bayesian") NA else fit_b$boundary_confirmed,
+    convergence_model_a = if (ESTIMATION_ENGINE == "bayesian") "MCMC" else extract_convergence_message(model_a),
+    convergence_model_b = if (ESTIMATION_ENGINE == "bayesian") "MCMC" else extract_convergence_message(model_b),
+    max_rhat_model_a = diagnostics_a$max_rhat,
+    max_rhat_model_b = diagnostics_b$max_rhat,
+    min_ess_model_a = diagnostics_a$min_ess,
+    min_ess_model_b = diagnostics_b$min_ess,
+    divergent_model_a = diagnostics_a$divergent_transitions,
+    divergent_model_b = diagnostics_b$divergent_transitions,
+    fit_minutes = as.numeric(difftime(Sys.time(), model_start_time, units = "mins")),
     model_axes = paste(model_axes, collapse = " + "),
     axes_dropped = paste(setdiff(axes, model_axes), collapse = ", ")
   )
 
-  fit_attempts <- bind_rows(
-    fit_a$attempts %>% mutate(model = "A"),
-    fit_b$attempts %>% mutate(model = "B")
-  ) %>%
+  fit_attempts <- if (ESTIMATION_ENGINE == "bayesian") {
+    bind_rows(
+      data.frame(model = "A", optimizer = "stan/hmc", status = "fitted",
+                 log_likelihood = NA_real_, variance = variance_a,
+                 singular = NA, detail = paste0(
+                   "rhat ", formatC(diagnostics_a$max_rhat, format = "f", digits = 3),
+                   "; min ESS ", round(diagnostics_a$min_ess),
+                   "; divergences ", diagnostics_a$divergent_transitions)),
+      data.frame(model = "B", optimizer = "stan/hmc", status = "fitted",
+                 log_likelihood = NA_real_, variance = variance_b,
+                 singular = NA, detail = paste0(
+                   "rhat ", formatC(diagnostics_b$max_rhat, format = "f", digits = 3),
+                   "; min ESS ", round(diagnostics_b$min_ess),
+                   "; divergences ", diagnostics_b$divergent_transitions))
+    )
+  } else {
+    bind_rows(
+      fit_a$attempts %>% mutate(model = "A"),
+      fit_b$attempts %>% mutate(model = "B")
+    )
+  } %>%
     mutate(specification = specification, outcome = outcome) %>%
     select(specification, outcome, model, everything())
 
-  fixed_effects <- extract_fixed_effects(
-    model_b, strata, model_axes, specification, specification_label,
-    outcome, outcome_label
-  )
+  fixed_effects <- if (ESTIMATION_ENGINE == "bayesian") {
+    extract_fixed_effects_bayesian(
+      model_b, strata, model_axes, specification, specification_label,
+      outcome, outcome_label
+    )
+  } else {
+    extract_fixed_effects(
+      model_b, strata, model_axes, specification, specification_label,
+      outcome, outcome_label
+    )
+  }
 
   if (SAVE_MODELS) {
     model_file <- file.path(
@@ -1758,6 +2476,13 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     )
     register_output(model_file)
   }
+
+  # Everything needed downstream has now been extracted, so the fitted objects
+  # are released here rather than at the end of the loop. Under MCMC these are
+  # by far the largest objects in the session, and holding one a moment longer
+  # than necessary is what turns a long run into a failed one.
+  rm(model_a, model_b)
+  invisible(gc(verbose = FALSE))
 
   list(
     metrics = metrics,
@@ -1922,6 +2647,22 @@ colour_predicted <- unname(nature_colours["blue"])
 colour_interaction <- unname(nature_colours["teal"])
 colour_charcoal <- unname(nature_colours["charcoal"])
 
+# A Bayesian interval is a credible interval and a maximum-likelihood one is a
+# confidence interval. They are not the same object and should not be labelled
+# as though they were, so the wording follows the engine throughout the
+# figures, the Word tables and the generated manuscript.
+INTERVAL_LABEL <- if (ESTIMATION_ENGINE == "bayesian") {
+  "95% credible interval"
+} else {
+  "95% confidence interval"
+}
+INTERVAL_SHORT <- if (ESTIMATION_ENGINE == "bayesian") "95% CrI" else "95% CI"
+ESTIMATE_LABEL <- if (ESTIMATION_ENGINE == "bayesian") {
+  if (POSTERIOR_ROBUST) "posterior median" else "posterior mean"
+} else {
+  "maximum likelihood estimate"
+}
+
 add_condition_labels <- function(data) {
   specification <- unique(data$specification)
   if (length(specification) != 1L || !specification %in% names(SPECIFICATIONS)) {
@@ -2058,7 +2799,8 @@ make_figures <- function(predictions, metrics_row) {
     scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
     labs(
       title = "B. Predicted risk by intersectional stratum",
-      subtitle = "Model B: additive main effects plus stratum random effect",
+      subtitle = paste0("Model B: additive main effects plus stratum random ",
+                        "effect. Bars are ", INTERVAL_SHORT, "."),
       x = "Stratum rank", y = "Predicted event probability"
     ) + publication_theme
 
@@ -2116,14 +2858,15 @@ make_figures <- function(predictions, metrics_row) {
       ) +
       scale_colour_manual(
         values = c(`FALSE` = "grey55", `TRUE` = colour_interaction),
-        labels = c(`FALSE` = "Interval includes zero",
-                   `TRUE` = "Interval excludes zero"),
+        labels = c(`FALSE` = paste(INTERVAL_SHORT, "includes zero"),
+                   `TRUE` = paste(INTERVAL_SHORT, "excludes zero")),
         drop = FALSE
       ) +
       scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
       labs(
         title = "C. Intersectional interaction residuals",
-        subtitle = "Difference from additive predicted probability",
+        subtitle = paste0("Absolute risk due to interaction, with ",
+                          INTERVAL_SHORT),
         x = "Stratum rank", y = "Probability difference", colour = NULL
       ) + publication_theme
   }
@@ -2320,11 +3063,35 @@ for (specification_name in names(SPECIFICATIONS)) {
     # Each analysis is isolated. A failure on one outcome is recorded and the
     # run continues, rather than discarding every result computed so far.
     analysis_status <- tryCatch({
-      if (RESUME && file.exists(paste0(table_prefix, "__metrics.csv"))) {
-        log_message("  Existing results found; skipping (resume mode).")
-        all_metrics[[result_key]] <- read.csv(
-          paste0(table_prefix, "__metrics.csv")
+      resume_files <- paste0(table_prefix,
+                             c("__metrics.csv", "__fixed_effects.csv",
+                               "__stratum_predictions.csv",
+                               "__stratum_retention.csv"))
+      if (RESUME && all(file.exists(resume_files))) {
+        # Every per-analysis output is restored, not just the metrics, so the
+        # consolidated tables written at the end of a resumed run are complete
+        # rather than containing only the outcomes fitted in this session.
+        log_message("  Existing results found; restoring and skipping ",
+                    "(resume mode).")
+        all_metrics[[result_key]] <- read.csv(resume_files[1L])
+        all_fixed_effects[[result_key]] <- read.csv(resume_files[2L])
+        restored_predictions <- read.csv(resume_files[3L])
+        all_predictions[[result_key]] <- restored_predictions
+        all_retention[[result_key]] <- read.csv(resume_files[4L])
+
+        restored_ranked <- restored_predictions %>% arrange(total_probability)
+        all_extremes[[result_key]] <- bind_rows(
+          head(restored_ranked, N_EXTREME) %>%
+            mutate(extreme = "Lowest predicted risk"),
+          tail(restored_ranked, N_EXTREME) %>%
+            mutate(extreme = "Highest predicted risk")
         )
+        all_significant[[result_key]] <- restored_predictions %>%
+          filter(interaction_distinguishable_fdr)
+        axis_file <- paste0(table_prefix, "__axis_decomposition.csv")
+        if (file.exists(axis_file)) {
+          all_axis_decomposition[[result_key]] <- read.csv(axis_file)
+        }
         "skipped"
       } else {
         counted <- make_stratum_counts(prepared, axes, outcome)
@@ -2447,6 +3214,10 @@ for (specification_name in names(SPECIFICATIONS)) {
                          paste0(table_prefix, "__stratum_predictions.csv"))
         write_csv_output(retention_row,
                          paste0(table_prefix, "__stratum_retention.csv"))
+        if (!is.null(fit$axis_decomposition)) {
+          write_csv_output(fit$axis_decomposition,
+                           paste0(table_prefix, "__axis_decomposition.csv"))
+        }
 
         # Figures are isolated from the analysis result. The model output is
         # already written by this point, so a device or layout failure is
@@ -2523,7 +3294,32 @@ for (specification_name in names(SPECIFICATIONS)) {
       "failed"
     })
 
-    invisible(gc(verbose = FALSE))
+    # A projection after each analysis turns "is this going to finish tonight?"
+    # into a number, which matters when a run is left unattended.
+    elapsed_so_far <- as.numeric(difftime(Sys.time(), RUN_STARTED_AT,
+                                          units = "mins"))
+    if (run_index < total_analyses && run_index > 0L) {
+      projected_total <- elapsed_so_far / run_index * total_analyses
+      log_message("  Progress: ", run_index, "/", total_analyses, "; elapsed ",
+                  formatC(elapsed_so_far, format = "f", digits = 1),
+                  " min; projected total ",
+                  formatC(projected_total, format = "f", digits = 0),
+                  " min (finish about ",
+                  format(RUN_STARTED_AT + projected_total * 60, "%H:%M"), ").")
+    }
+
+    memory_used <- gc(verbose = FALSE)
+    if (REPORT_MEMORY) {
+      # gc() reports megabytes in a column whose name varies with the R build,
+      # so it is matched rather than assumed by position.
+      megabyte_column <- grep("Mb", colnames(memory_used), value = TRUE)[1L]
+      megabytes <- if (!is.na(megabyte_column)) {
+        sum(memory_used[, megabyte_column], na.rm = TRUE)
+      } else NA_real_
+      log_message("  Memory in use: ",
+                  formatC(megabytes, format = "f", digits = 0),
+                  " MB of R objects.")
+    }
   }
 }
 
@@ -2892,13 +3688,17 @@ word_model_metrics <- metrics_table %>%
     `Analysed N` = format_integer(analysed_n),
     `Event %` = format_number(event_percent, 2),
     `VPC A (%)` = format_number(vpc_model_a_percent, 2),
-    `VPC A 95% CI` = ifelse(
+    `VPC A interval` = ifelse(
       is.na(vpc_model_a_low), "",
       paste0(format_number(vpc_model_a_low, 2), " to ",
              format_number(vpc_model_a_high, 2))
     ),
     `VPC B (%)` = format_number(vpc_model_b_percent, 2),
     `PCV (%)` = format_number(pcv_percent, 2),
+    `PCV interval` = ifelse(
+      is.na(pcv_low), "",
+      paste0(format_number(pcv_low, 1), " to ", format_number(pcv_high, 1))
+    ),
     `MOR A` = format_number(mor_model_a, 2),
     `MOR B` = format_number(mor_model_b, 2),
     `AUC additive` = format_number(auc_model_b_fixed, 3),
@@ -2914,13 +3714,16 @@ word_fixed_effects <- fixed_effects_table %>%
     Variable = variable_label,
     Level = level,
     OR = ifelse(is_reference, "1.00 (ref)", format_number(odds_ratio, 2)),
-    `95% CI` = ifelse(
+    `Interval` = ifelse(
       is_reference | is.na(confidence_low), "",
       paste0(format_number(confidence_low, 2), " to ",
              format_number(confidence_high, 2))
     ),
     `p` = format_p_value(p_value)
-  )
+  ) %>%
+  # A posterior has no p-value, so the column is dropped rather than left as a
+  # row of blanks implying a test was performed.
+  { if (ESTIMATION_ENGINE == "bayesian") select(., -p) else . }
 
 word_extremes <- extremes_table %>%
   transmute(
@@ -2954,7 +3757,12 @@ word_significant <- if (nrow(significant_table) > 0L) {
         format_number(100 * interaction_probability_difference_high, 2)
       ),
       `q` = format_p_value(interaction_q_value)
-    )
+    ) %>%
+    { if (ESTIMATION_ENGINE == "bayesian" &&
+          "interaction_probability_of_direction" %in% names(significant_table)) {
+        mutate(., `Prob. of direction` = format_number(
+          100 * significant_table$interaction_probability_of_direction, 1))
+      } else . }
 } else {
   data.frame(
     Result = paste0(
@@ -3068,6 +3876,48 @@ word_tables <- list(
        ),
        filename = "Table_9_significant_interactions.docx", font_size = 7.5)
 )
+
+word_diagnostics <- if (ESTIMATION_ENGINE == "bayesian" &&
+                        any(!is.na(metrics_table$max_rhat_model_a))) {
+  metrics_table %>%
+    transmute(
+      Outcome = outcome_label,
+      `R-hat A` = format_number(max_rhat_model_a, 3),
+      `R-hat B` = format_number(max_rhat_model_b, 3),
+      `Min ESS A` = format_integer(min_ess_model_a),
+      `Min ESS B` = format_integer(min_ess_model_b),
+      `Divergences A` = format_integer(divergent_model_a),
+      `Divergences B` = format_integer(divergent_model_b),
+      `Fit minutes` = format_number(fit_minutes, 1),
+      Status = ifelse(
+        pmax(max_rhat_model_a, max_rhat_model_b, na.rm = TRUE) > MAX_RHAT |
+          pmin(min_ess_model_a, min_ess_model_b, na.rm = TRUE) <
+            MIN_EFFECTIVE_SAMPLE_SIZE,
+        "Check", "OK"
+      )
+    )
+} else {
+  NULL
+}
+
+if (!is.null(word_diagnostics)) {
+  word_tables[[length(word_tables) + 1L]] <- list(
+    number = length(word_tables) + 1L,
+    title = "Markov Chain Monte Carlo Convergence Diagnostics",
+    data = word_diagnostics,
+    note = paste0(
+      "R-hat compares within- and between-chain variance and should be below ",
+      MAX_RHAT, "; effective sample size should exceed ",
+      MIN_EFFECTIVE_SAMPLE_SIZE,
+      "; divergent transitions should be zero. Models were fitted with ",
+      MCMC_CHAINS, " chains of ", MCMC_ITERATIONS, " iterations (",
+      MCMC_WARMUP, " warmup), adapt_delta ", MCMC_ADAPT_DELTA,
+      ". Rows marked Check did not meet a threshold and should be refitted ",
+      "with more iterations before the results are relied upon."
+    ),
+    filename = "Table_12_mcmc_diagnostics.docx", font_size = 8
+  )
+}
 
 if (!is.null(word_axis_decomposition)) {
   word_tables[[length(word_tables) + 1L]] <- list(
@@ -3366,6 +4216,108 @@ save_plot_pair(p_vpc_benchmark,
                          "summary__vpc_benchmark"),
                width = 11, height = 7)
 
+# --- Variance components with their intervals -------------------------------
+# The single clearest advantage of the Bayesian fit is that the VPC and PCV
+# arrive with intervals, so they can be plotted as estimates with uncertainty
+# rather than as bare points. Drawn whenever intervals exist, which under
+# maximum likelihood means whenever profiling succeeded.
+if (any(!is.na(metrics_table$vpc_model_a_low))) {
+  variance_components <- bind_rows(
+    metrics_table %>%
+      transmute(outcome_label,
+                quantity = "VPC, Model A (null)",
+                estimate = vpc_model_a_percent,
+                low = vpc_model_a_low, high = vpc_model_a_high),
+    metrics_table %>%
+      transmute(outcome_label,
+                quantity = "VPC, Model B (additive)",
+                estimate = vpc_model_b_percent,
+                low = vpc_model_b_low, high = vpc_model_b_high),
+    metrics_table %>%
+      transmute(outcome_label,
+                quantity = "PCV, A to B",
+                estimate = pcv_percent,
+                low = pcv_low, high = pcv_high)
+  )
+
+  p_variance_components <- ggplot(
+    variance_components,
+    aes(x = estimate, y = reorder(outcome_label, estimate))
+  ) +
+    geom_errorbar(aes(xmin = low, xmax = high), orientation = "y",
+                  width = 0, linewidth = 0.45, colour = colour_predicted) +
+    geom_point(size = 2.4, colour = colour_predicted) +
+    facet_wrap(~ quantity, scales = "free_x") +
+    labs(
+      title = "Variance components with uncertainty",
+      subtitle = paste0(ESTIMATE_LABEL, " and ", INTERVAL_LABEL,
+                        ". Note the differing horizontal scales."),
+      x = "Percent", y = NULL
+    ) + publication_theme
+
+  save_plot_pair(p_variance_components,
+                 file.path(OUTPUT_ROOT, "figures", "individual",
+                           "summary__variance_components"),
+                 width = 13, height = 7)
+}
+
+# --- MCMC diagnostics -------------------------------------------------------
+# Convergence is a property of the run, not an assumption, so it is plotted
+# rather than left buried in a column. Anything the wrong side of the
+# thresholds is coloured so it cannot be missed at a glance.
+if (ESTIMATION_ENGINE == "bayesian" &&
+    any(!is.na(metrics_table$max_rhat_model_a))) {
+  diagnostics_long <- bind_rows(
+    metrics_table %>%
+      transmute(outcome_label, model = "Model A",
+                rhat = max_rhat_model_a, ess = min_ess_model_a,
+                divergences = divergent_model_a),
+    metrics_table %>%
+      transmute(outcome_label, model = "Model B",
+                rhat = max_rhat_model_b, ess = min_ess_model_b,
+                divergences = divergent_model_b)
+  )
+
+  p_rhat <- ggplot(diagnostics_long,
+                   aes(x = rhat, y = reorder(outcome_label, rhat),
+                       colour = rhat > MAX_RHAT, shape = model)) +
+    geom_vline(xintercept = MAX_RHAT, linetype = "dashed", linewidth = 0.4,
+               colour = "grey45") +
+    geom_point(size = 2.4, position = position_dodge(width = 0.5)) +
+    scale_colour_manual(values = c(`FALSE` = colour_interaction,
+                                   `TRUE` = colour_observed),
+                        labels = c(`FALSE` = "Within threshold",
+                                   `TRUE` = "Above threshold"),
+                        drop = FALSE) +
+    labs(title = "A. Convergence (R-hat)",
+         subtitle = paste0("Dashed line at ", MAX_RHAT),
+         x = "Maximum R-hat", y = NULL, colour = NULL, shape = NULL) +
+    publication_theme
+
+  p_ess <- ggplot(diagnostics_long,
+                  aes(x = ess, y = reorder(outcome_label, ess),
+                      colour = ess < MIN_EFFECTIVE_SAMPLE_SIZE, shape = model)) +
+    geom_vline(xintercept = MIN_EFFECTIVE_SAMPLE_SIZE, linetype = "dashed",
+               linewidth = 0.4, colour = "grey45") +
+    geom_point(size = 2.4, position = position_dodge(width = 0.5)) +
+    scale_colour_manual(values = c(`FALSE` = colour_interaction,
+                                   `TRUE` = colour_observed),
+                        labels = c(`FALSE` = "Adequate",
+                                   `TRUE` = "Below threshold"),
+                        drop = FALSE) +
+    labs(title = "B. Effective sample size",
+         subtitle = paste0("Dashed line at ", MIN_EFFECTIVE_SAMPLE_SIZE),
+         x = "Minimum effective sample size", y = NULL, colour = NULL,
+         shape = NULL) +
+    publication_theme
+
+  p_diagnostics <- p_rhat | p_ess
+  save_plot_pair(p_diagnostics,
+                 file.path(OUTPUT_ROOT, "figures", "individual",
+                           "summary__mcmc_diagnostics"),
+                 width = 14, height = 7)
+}
+
 # --- Descriptive figures ----------------------------------------------------
 # Drawn here rather than in section 3B because the publication theme is defined
 # with the other figure code.
@@ -3536,6 +4488,8 @@ manifest <- data.frame(
     "input_file", "output_root", "test_mode", "n_specifications",
     "n_outcomes", "n_analyses_attempted", "n_analyses_completed",
     "n_analyses_failed", "min_stratum_n", "min_stratum_events",
+    "estimation_engine", "mcmc_chains", "mcmc_iterations", "mcmc_warmup",
+    "mcmc_adapt_delta", "prior_fixed_effects", "max_rhat", "min_ess",
     "fdr_level", "nAGQ", "seed", "ggprism_available", "svg_written",
     "plot_font", "elapsed_minutes", "r_version", "lme4_version",
     "completed_at_utc"
@@ -3544,6 +4498,8 @@ manifest <- data.frame(
     DATA_PATH, OUTPUT_ROOT, TEST_MODE, length(SPECIFICATIONS),
     length(OUTCOME_LABELS), total_analyses, completed_analyses,
     nrow(failures_table), MIN_STRATUM_N, MIN_STRATUM_EVENTS,
+    ESTIMATION_ENGINE, MCMC_CHAINS, MCMC_ITERATIONS, MCMC_WARMUP,
+    MCMC_ADAPT_DELTA, PRIOR_FIXED_EFFECTS, MAX_RHAT, MIN_EFFECTIVE_SAMPLE_SIZE,
     FDR_LEVEL, N_AGQ, 20260814, HAS_GGPRISM, WRITE_SVG,
     if (nzchar(PLOT_FONT)) PLOT_FONT else "device default",
     formatC(elapsed_minutes, format = "f", digits = 1),

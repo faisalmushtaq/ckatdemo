@@ -238,6 +238,18 @@ LME4_VERSION <- manifest_value("lme4_version", "")
 
 if (is.na(DISCLOSURE_THRESHOLD)) DISCLOSURE_THRESHOLD <- MIN_STRATUM_N
 
+# The generated text follows whichever engine actually produced the results, so
+# a Bayesian run is never described in frequentist language or the reverse.
+ENGINE <- if ("estimation_engine" %in% names(metrics)) {
+  as.character(metrics$estimation_engine[1L])
+} else {
+  "mle"
+}
+IS_BAYESIAN <- identical(ENGINE, "bayesian")
+INTERVAL_NAME <- if (IS_BAYESIAN) "credible interval" else "confidence interval"
+INTERVAL_SHORT <- if (IS_BAYESIAN) "95% CrI" else "95% CI"
+ESTIMATE_NAME <- if (IS_BAYESIAN) "posterior median" else "maximum likelihood estimate"
+
 if (!nzchar(PRIMARY_OUTCOME)) PRIMARY_OUTCOME <- metrics$outcome[1L]
 if (!PRIMARY_OUTCOME %in% metrics$outcome) {
   stop("MANUSCRIPT_PRIMARY_OUTCOME is not among the analysed outcomes: ",
@@ -339,7 +351,7 @@ interval_suffix <- function(low, high, digits = 1, percent = FALSE) {
   }
   formatter <- if (percent) function(x) fmt_pct(x, digits) else
     function(x) fmt_num(x, if (percent) digits else 2)
-  paste0(" (95% CI ", formatter(low), " to ", formatter(high), ")")
+  paste0(" (", INTERVAL_SHORT, " ", formatter(low), " to ", formatter(high), ")")
 }
 
 # Published VPC values for health outcomes, from the systematic review by
@@ -719,23 +731,61 @@ build_methods <- function() {
       "maximum likelihood using the Laplace approximation (nAGQ = ", N_AGQ,
       ") with the bobyqa optimiser."
     ),
-    paste0(
-      "Much of the applied MAIHDA literature estimates these models in a ",
-      "Bayesian framework using Markov chain Monte Carlo, which yields ",
-      "credible intervals for the variance components directly from the ",
-      "posterior and can be better behaved when many strata are small. We used ",
-      "maximum likelihood, which the methodological tutorial literature also ",
-      "supports, because it is deterministic, requires no prior specification ",
-      "or convergence diagnostics, and is therefore more straightforward to ",
-      "audit and reproduce within a trusted research environment. The ",
-      "minimum cell size rule applied here also removes the smallest strata, ",
-      "which is where the two approaches would be most likely to diverge. ",
-      "Uncertainty in the variance components was quantified by ",
-      "profile-likelihood intervals on the random-effect standard deviation, ",
-      "transformed to the variance, variance partition coefficient and median ",
-      "odds ratio scales; all three transformations are monotonic, so the ",
-      "interval endpoints carry across directly."
-    ),
+    if (IS_BAYESIAN) {
+      paste0(
+        "Models were estimated in a Bayesian framework by Hamiltonian Monte ",
+        "Carlo using Stan through the brms package, following the Bayesian ",
+        "companion code to the tutorial. We ran ", manifest_value("mcmc_chains", "4"),
+        " chains of ", manifest_value("mcmc_iterations", "2000"),
+        " iterations each, discarding the first ",
+        manifest_value("mcmc_warmup", "1000"), " as warmup. Default weakly ",
+        "informative priors were retained for the intercept and the ",
+        "between-stratum standard deviation. For the fixed-effect ",
+        "coefficients the default flat prior was replaced with a ",
+        manifest_value("prior_fixed_effects", "normal(0, 1)"),
+        " prior, because a flat prior on the logit scale is poorly behaved: ",
+        "transformed to the probability scale it concentrates its mass near ",
+        "zero and one."
+      )
+    } else {
+      paste0(
+        "Uncertainty in the variance components was quantified by ",
+        "profile-likelihood intervals on the random-effect standard ",
+        "deviation, transformed to the variance, variance partition ",
+        "coefficient and median odds ratio scales; all three transformations ",
+        "are monotonic, so the interval endpoints carry across directly."
+      )
+    },
+    if (IS_BAYESIAN) {
+      paste0(
+        "Estimating these models in a Bayesian framework has a specific ",
+        "advantage for intersectional MAIHDA. The quantities of primary ",
+        "interest are nonlinear functions of both the fixed and the random ",
+        "parts of the model: the variance partition coefficient, the ",
+        "proportional change in variance, and, on the probability scale, the ",
+        "total predicted risk and the absolute risk due to interaction for ",
+        "each stratum. Under maximum likelihood, intervals for these require ",
+        "an assumption of zero covariance between the fixed and random ",
+        "components together with a further approximation. Working from the ",
+        "posterior, each quantity is instead computed within every draw and ",
+        "then summarised, so its interval requires no such assumption. All ",
+        "point estimates are posterior medians and all intervals are 95% ",
+        "credible intervals given as the 2.5th and 97.5th percentiles of the ",
+        "posterior."
+      )
+    } else NULL,
+    if (IS_BAYESIAN) {
+      paste0(
+        "Convergence was assessed for every model by the potential scale ",
+        "reduction factor (R-hat), the bulk and tail effective sample sizes, ",
+        "and the number of divergent transitions. R-hat was required to be ",
+        "below ", manifest_value("max_rhat", "1.01"),
+        " and effective sample sizes above ",
+        manifest_value("min_ess", "400"),
+        ". Diagnostics for every model are reported alongside the results, ",
+        "and any model failing a threshold is identified there."
+      )
+    } else NULL,
     paste0(
       "Where a random-intercept variance was estimated at the zero boundary, ",
       "we refitted the model with alternative optimisers to distinguish a ",
@@ -792,7 +842,15 @@ build_methods <- function() {
       "minimum stratum size ", oxford(as.character(thresholds)),
       ") and compared the resulting variance partition coefficients, ",
       "proportional change in variance and median odds ratios, alongside the ",
-      "share of the cohort retained at each threshold."
+      "share of the cohort retained at each threshold.",
+      if (IS_BAYESIAN) {
+        paste0(" This sweep was fitted by maximum likelihood rather than by ",
+               "Markov chain Monte Carlo. It addresses whether the trimming ",
+               "threshold alters the variance components, which the point ",
+               "estimates answer directly, and refitting it under MCMC would ",
+               "have multiplied computation without changing what the ",
+               "sensitivity analysis establishes.")
+      } else ""
     )
   }
 

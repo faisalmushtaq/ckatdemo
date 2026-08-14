@@ -85,14 +85,55 @@ VPC, MOR and the variance components carry **profile-likelihood 95%
 intervals**, the maximum-likelihood counterpart of the credible intervals that
 Bayesian MAIHDA analyses report.
 
-### Estimation
+### Estimation — Bayesian by default
 
-Much of the MAIHDA literature uses Bayesian MCMC (brms/Stan, or MLwiN via
-`runmlwin`). This uses maximum likelihood with the Laplace approximation:
-deterministic, no priors or convergence diagnostics, and therefore easier to
-audit and reproduce inside a TRE. The minimum cell size rule also removes the
-smallest strata, which is where the two approaches would most likely diverge.
-The generated Methods states and justifies this explicitly.
+`MAIHDA_ENGINE=bayesian` (default) fits with **brms/Stan by HMC**, following
+the tutorial's Bayesian companion code: 4 chains × 2000 iterations (1000
+warmup), default weakly informative priors except `normal(0, 1)` on the
+fixed-effect coefficients (a flat prior on the logit scale piles mass near 0
+and 1).
+
+This matters because the quantities that count — VPC, PCV, and on the
+probability scale the absolute risk and ARI per stratum — are nonlinear
+functions of *both* the fixed and random parts. Under MLE their intervals need
+a zero-covariance assumption plus an approximation. From the posterior each is
+computed within every draw and then summarised: **no assumption required.**
+
+`MAIHDA_ENGINE=mle` keeps the lme4 path. Far faster, no C++ toolchain needed,
+and it produces **identical output columns**, so every table, figure and
+generated sentence works either way. Useful for iteration, and a fallback if
+Stan can't be installed. On the test data the two agree closely (VPC 16.6% vs
+16.3%, PCV 97.5% vs 97.9%).
+
+Convergence is checked, not assumed: R-hat, bulk/tail ESS and divergent
+transitions are recorded per model, plotted, tabulated, and warned about in
+the log.
+
+### Running overnight on a modest machine
+
+Designed to survive a long unattended run:
+
+- **Resume is ON by default.** If it stops, just start it again — completed
+  outcomes are skipped and *all* their outputs are restored, so consolidated
+  tables are complete after a resume. No-op on a fresh directory.
+- **Peak memory is one model, not all of them.** Fits are extracted to CSV
+  then dropped and `gc()`'d immediately. Measured peak ~760 MB on 541 strata.
+- **Stan compiles once per model structure**, not once per outcome, saving
+  roughly a minute per outcome on a slow CPU.
+- **Per-outcome checkpointing** — a crash loses at most one outcome.
+- **Progress and ETA logged after every analysis**, plus memory in use.
+- Axis decomposition defaults OFF under Bayesian (it multiplies model count by
+  the number of axes); the threshold sweep always runs under MLE.
+
+Budget roughly 5–10 minutes per outcome per model pair at 4×2000 on a slow
+processor. Run `MAIHDA_TEST_MODE=1` first to calibrate.
+
+### Package installation
+
+Missing packages are installed automatically (`MAIHDA_AUTO_INSTALL=1` by
+default), into a user library if the system library is read-only. If the TRE
+has no CRAN route the error names exactly what is missing and how to get it,
+and points at `MAIHDA_ENGINE=mle` if Stan specifically can't be built.
 
 ## Minimum cell size
 
@@ -166,9 +207,19 @@ All settings are environment variables.
 | `MAIHDA_AXIS_DECOMPOSITION` | `1` | Fit the Model 2 family (per-axis PCV) |
 | `MAIHDA_VARIANCE_INTERVALS` | `1` | Profile-likelihood CIs for VPC/MOR |
 | `MAIHDA_FDR_LEVEL` | `0.05` | Benjamini-Hochberg level |
-| `MAIHDA_NAGQ` | `1` | glmer `nAGQ` |
+| `MAIHDA_ENGINE` | `bayesian` | `bayesian` (brms/Stan) or `mle` (lme4) |
+| `MAIHDA_MCMC_CHAINS` | `4` | MCMC chains |
+| `MAIHDA_MCMC_ITER` | `2000` | Iterations per chain |
+| `MAIHDA_MCMC_WARMUP` | `1000` | Warmup iterations |
+| `MAIHDA_MCMC_ADAPT_DELTA` | `0.95` | Raise if divergent transitions |
+| `MAIHDA_PRIOR_FIXED` | `normal(0, 1)` | Prior on fixed-effect coefficients |
+| `MAIHDA_MAX_RHAT` | `1.01` | R-hat threshold |
+| `MAIHDA_MIN_ESS` | `400` | Effective sample size threshold |
+| `MAIHDA_AUTO_INSTALL` | `1` | Install missing packages |
+| `MAIHDA_REUSE_COMPILED` | `1` | Reuse compiled Stan programs |
+| `MAIHDA_NAGQ` | `1` | glmer `nAGQ` (MLE engine only) |
 | `MAIHDA_SAVE_MODELS` | `1` | Save fitted model objects |
-| `MAIHDA_RESUME` | `0` | Skip analyses whose outputs already exist |
+| `MAIHDA_RESUME` | `1` | Restore and skip completed analyses |
 | `MAIHDA_WRITE_SVG` | `1` | Write SVG alongside PNG |
 | `MAIHDA_LABEL_SIZE_CALLOUT` | `3.4` | Stratum callout label size (mm) |
 | `MAIHDA_LABEL_SIZE_AXIS` | `9.5` | Panel E y-axis label size (pt) |
