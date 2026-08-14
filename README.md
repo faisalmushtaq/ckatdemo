@@ -11,6 +11,7 @@ Health*, 26, 101664.
 | --- | --- |
 | `R/run_maihda_analysis.R` | The analysis. Runs end to end and writes every table and figure. |
 | `R/generate_manuscript.R` | Reads the analysis output and writes a complete Methods and Results section with the actual values in place. |
+| `tools/check_stan_toolchain.R` | Verifies the Bayesian toolchain (compiler, packages, Boost headers) and can repair the common Debian/Ubuntu Boost problem. Run once before an overnight run. |
 | `tools/make_simulated_analysis_master.R` | Builds a simulated `analysis_master` with the same schema, for development and testing without patient data. |
 
 ## Running it
@@ -127,6 +128,34 @@ Designed to survive a long unattended run:
 
 Budget roughly 5–10 minutes per outcome per model pair at 4×2000 on a slow
 processor. Run `MAIHDA_TEST_MODE=1` first to calibrate.
+
+### Before the first Bayesian run
+
+```bash
+Rscript tools/check_stan_toolchain.R          # diagnose
+Rscript tools/check_stan_toolchain.R --fix    # diagnose and repair
+```
+
+It ends by compiling and sampling a minimal Stan model, which is the only
+check that really settles whether the toolchain works.
+
+**The Boost trap on Debian/Ubuntu.** `install.packages("BH")` is what rstan
+expects, but the distribution package `r-cran-bh` is a *shim*: it installs an
+R package named BH containing metadata and help files but **no headers at
+all**, declaring `Depends: libboost-dev` instead. rstan looks inside the R
+package, finds nothing, and stops with `Boost not found; call
+install.packages('BH')` — even though Boost is installed. Confirm with:
+
+```r
+system.file("include", package = "BH")   # empty string = the shim
+```
+
+Fix it either by installing the real CRAN BH, or — with no network at all —
+by pointing the shim at the system headers `libboost-dev` already provides:
+
+```bash
+ln -s /usr/include/boost "$(Rscript -e 'cat(find.package("BH"))')/include/boost"
+```
 
 ### Package installation
 
