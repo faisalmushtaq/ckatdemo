@@ -608,14 +608,24 @@ build_methods <- function() {
       "reported model quantities refer to the retained analytic sample."
     ),
     paste0(
-      "We note that the MAIHDA literature does not itself require trimming: ",
-      "partial pooling means that a very small stratum contributes little to ",
-      "its own estimate and is shrunk towards the additive prediction. The ",
-      "threshold was applied to satisfy statistical disclosure control, ",
-      "because this analysis reports stratum-level estimates and names ",
-      "individual strata, and ", MIN_STRATUM_N, " is the lowest threshold ",
-      "meeting that requirement. Its effect on the substantive conclusions ",
-      "was assessed in sensitivity analysis."
+      "We note that the MAIHDA methodological literature does not require ",
+      "trimming, and that the tutorial literature does not apply it: partial ",
+      "pooling means a very small stratum contributes little to its own ",
+      "estimate and is shrunk towards the additive prediction, and simulation ",
+      "studies have reported robust estimate accuracy for both linear and ",
+      "logistic MAIHDA at average stratum sizes of around ten observations. ",
+      "The recommended practice is instead to report the distribution of ",
+      "stratum sizes and to choose category granularity so that most strata ",
+      "are adequately sized, both of which we do."
+    ),
+    paste0(
+      "The threshold was therefore applied not to improve estimation but to ",
+      "satisfy statistical disclosure control, because this analysis reports ",
+      "stratum-level estimates and names individual strata, and ",
+      MIN_STRATUM_N, " is the lowest threshold meeting that requirement. ",
+      "Because this is a departure from the reference approach, its effect on ",
+      "the substantive conclusions was assessed in sensitivity analysis across ",
+      "a range of thresholds including no trimming at all."
     )
   )
 
@@ -646,14 +656,16 @@ build_methods <- function() {
     ),
     if (!is.null(axis_decomposition)) {
       paste0(
-        "The Model 2 family comprised a set of partially adjusted models, each ",
-        "adding a single stratum axis to Model A while retaining the stratum ",
-        "random intercept. Comparing the between-stratum variance of each of ",
-        "these against Model A isolates the contribution of that axis alone to ",
-        "the between-stratum variation. Because the axes are correlated in the ",
-        "population, these contributions overlap and do not sum to the fully ",
-        "adjusted value; they are reported individually rather than as a ",
-        "decomposition of a total."
+        "As a secondary and descriptive analysis, we additionally fitted a set ",
+        "of partially adjusted models, each adding a single stratum axis to ",
+        "Model A while retaining the stratum random intercept, to indicate ",
+        "which axes account for the between-stratum variation. Because the ",
+        "axes are correlated in the population, these contributions overlap ",
+        "and do not sum to the fully adjusted value. We report them with the ",
+        "caution that attending to individual axis contributions can encourage ",
+        "a reversion to single-axis reasoning about inequity, which is counter ",
+        "to the purpose of an intersectional analysis; they are secondary to ",
+        "the collective additive effect and the total stratum predictions."
       )
     } else NULL,
     paste0(
@@ -663,9 +675,10 @@ build_methods <- function() {
       "effects reproduce the purely additive expectation for each stratum, the ",
       "remaining random effects represent departures from that additive ",
       "prediction, and within the MAIHDA framework are interpreted as ",
-      "intersectional interaction residuals. This sequence corresponds to the ",
-      "simple intersectional, partially adjusted and intersectional ",
-      "interaction models described in the applied MAIHDA literature."
+      "intersectional interaction residuals. In the notation of the Evans et ",
+      "al. tutorial these are the logistic Models 2A and 2B respectively, also ",
+      "referred to as the simple intersectional and the intersectional ",
+      "interaction models."
     ),
     paste0(
       "For each stratum we report the absolute risk, being the model-predicted ",
@@ -1134,9 +1147,38 @@ build_results <- function() {
         )
       } else "",
       "Taken together with the high proportional change in variance, these ",
-      "results indicate that inequalities in these outcomes are well described ",
-      "by the additive combination of the constituent social and clinical ",
-      "positions, without evidence of multiplicative intersectional effects."
+      "results indicate that inequities between strata in these outcomes are ",
+      "well characterised by the additive combination of the constituent ",
+      "social and clinical positions, without additional multiplicative ",
+      "effects being required to describe them."
+    ),
+    # The tutorial (section 4.2) is explicit that a near-100% PCV must not be
+    # written up as an absence of intersectionality. Three caveats belong with
+    # any such result, and omitting them is the most common way this finding is
+    # over-interpreted.
+    paste0(
+      "Three caveats attach to this finding. First, the variance partition ",
+      "coefficient and proportional change in variance are summary measures ",
+      "across the whole set of strata; a single stratum with a substantial ",
+      "interaction would be diluted by them, which is why individual strata ",
+      "were examined separately rather than relying on the summary measures ",
+      "alone. Second, the precision weighting that makes these estimates ",
+      "robust also shrinks them towards the additive prediction, so genuine ",
+      "interactions may exist in the population but be undetectable at the ",
+      "available stratum sizes; the approach protects against false positives ",
+      "at the cost of some power to detect small true effects. Third, and most ",
+      "importantly, an absence of detectable interaction is not evidence ",
+      "against intersectionality as a framework. It indicates that the ",
+      "experiences associated with these positions did not, for these outcomes ",
+      "in this population at this time, leave an imprint requiring ",
+      "multiplicative as well as additive terms to characterise."
+    ),
+    paste0(
+      "The substantive conclusion is therefore not that intersectionality is ",
+      "unimportant here, but that there are meaningful inequities between ",
+      "intersectional strata, that the axes examined were collectively ",
+      "important in capturing those inequities, and that the resulting ",
+      "distribution of harm should inform how care and resources are directed."
     ))
   } else {
     n_with <- nrow(outcomes_with_interactions)
@@ -1189,7 +1231,12 @@ build_results <- function() {
           }
         ),
         capitalise_first(paste0(oxford(stratum_sentences), ".")),
-        " All strata surviving correction are listed in Table 9."
+        " All strata surviving correction are listed in Table 9. A large ",
+        "interaction residual does not by itself mean that a stratum is ",
+        "advantaged or disadvantaged in absolute terms; it means the total ",
+        "predicted risk for that stratum departs meaningfully from what the ",
+        "additive main effects alone would predict. Absolute risks for all ",
+        "strata are reported separately."
       ))
     }
   }
@@ -1200,8 +1247,11 @@ build_results <- function() {
   auc_gain <- metrics$auc_model_b_total - metrics$auc_model_b_fixed
   sections[["Discriminatory accuracy"]] <- c(
     paste0(
-      "Discriminatory accuracy was modest throughout, as is expected when ",
-      "prediction is based solely on social and clinical position. For ",
+      "Discriminatory accuracy is reported as a descriptive quantity rather ",
+      "than against conventional thresholds of predictive performance, since ",
+      "the intention is not to build a diagnostic model but to express how ",
+      "well intersectional position alone separates those who experience the ",
+      "outcome from those who do not. For ",
       outcome_in_sentence(primary_label), ", the area under the receiver operating ",
       "characteristic curve was ",
       stat_value(primary$auc_model_b_fixed, "AUC additive, primary outcome",

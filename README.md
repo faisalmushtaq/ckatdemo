@@ -55,17 +55,23 @@ two.
 
 ## Models
 
-The standard MAIHDA sequence, for each outcome:
+Following Evans et al. (2024), where the logistic models are **Model 2A** and
+**Model 2B**. (Beware: the Merlo/Persmark lineage numbers models 1/2/3, so
+"Model 2" means different things in the two traditions. This repo avoids the
+bare label.)
 
-- **Model A** (simple intersectional) — `outcome ~ 1 + (1 | stratum)`. Total
+- **Model A** = tutorial Model 2A (simple intersectional) — `outcome ~ 1 + (1 | stratum)`. Total
   between-stratum variation.
-- **Model 2 family** (partially adjusted) — one model per axis, each adding a
-  single axis to Model A. The PCV from each isolates that axis's contribution
-  to the between-stratum variance. This is what identifies *which* dimension
-  drives the variation; Model A and Model B alone cannot. Contributions
-  overlap and do not sum, because the axes are correlated.
-- **Model B** (intersectional interaction) — `outcome ~ additive main effects
-  + (1 | stratum)`. The remaining stratum random effects are the
+- **Partially adjusted single-axis models** (optional extension, not in the
+  tutorial) — one model per axis, each adding a single axis to Model A, so the
+  PCV isolates that axis's contribution. Contributions overlap and do not sum,
+  because the axes are correlated. **Secondary and descriptive only:** the
+  tutorial (§2.4.C.i) warns that attending to individual axis contributions
+  "seems to result in reversion to single-axis thinking about inequity ...
+  counter to the stated purpose of intersectional comparisons". Disable with
+  `MAIHDA_AXIS_DECOMPOSITION=0`.
+- **Model B** = tutorial Model 2B (intersectional interaction) — `outcome ~
+  additive main effects + (1 | stratum)`. The remaining stratum random effects are the
   intersectional interaction residuals.
 
 Outcomes are collapsed to one binomial record per stratum before fitting,
@@ -93,11 +99,17 @@ The generated Methods states and justifies this explicitly.
 Strata below `MAIHDA_MIN_STRATUM_N` individuals are excluded before fitting.
 The default is **10**.
 
-The MAIHDA literature does not itself require trimming — partial pooling means
-a stratum of four people contributes little to its own estimate and is shrunk
-towards the additive prediction. The floor exists to satisfy statistical
-disclosure control, since this analysis writes stratum-level tables and names
-individual strata on its figures. Ten is the lowest threshold that does so.
+**The tutorial does not trim at all**, and simulation studies report robust
+MAIHDA estimates at average stratum sizes around ten. The recommended practice
+is to report the size distribution (we do — at the tutorial's own 10/20/30/50/
+100+ breakpoints) and choose category granularity sensibly. Our floor exists
+only to satisfy statistical disclosure control, since this analysis writes
+stratum-level tables and names individual strata on its figures. Ten is the
+lowest threshold that does so.
+
+The sensitivity sweep includes **threshold 0**, so the untrimmed, canonical
+analysis is always available in the output — set `MAIHDA_MIN_STRATUM_N=0` to
+make it primary.
 
 Zero-event strata are **retained** by default. A stratum with 40 people and no
 events is an observation of low risk, not missing information; discarding

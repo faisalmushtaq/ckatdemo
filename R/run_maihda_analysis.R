@@ -207,23 +207,35 @@ RUN_THRESHOLD_SENSITIVITY <- env_flag("MAIHDA_THRESHOLD_SENSITIVITY",
                                       default = TRUE)
 SENSITIVITY_THRESHOLDS <- c(0, 5, 10, 20, 30, 50)
 
-# --- Model 2: per-axis variance decomposition -------------------------------
-# The established MAIHDA model sequence (Persmark et al. 2019; Merlo and
-# colleagues) is a family of three, not a pair:
+# --- Partially adjusted single-axis models ----------------------------------
+# An OPTIONAL EXTENSION, not part of the Evans et al. tutorial sequence.
 #
-#   Model 1  null / simple intersectional              (our Model A)
-#   Model 2  partially adjusted, ONE axis at a time    (added here)
-#   Model 3  fully adjusted, all additive main effects (our Model B)
+# A note on naming, because two MAIHDA lineages number their models
+# incompatibly. In the Evans et al. tutorial the logistic models are Model 2A
+# (null) and Model 2B (additive main effects) -- what this script calls Model A
+# and Model B. In the Merlo/Persmark lineage the sequence is Model 1 (null),
+# Model 2 (partially adjusted, one axis at a time) and Model 3 (fully
+# adjusted). "Model 2" therefore means completely different things in the two
+# traditions, so this script avoids the label entirely and describes these as
+# partially adjusted single-axis models.
 #
-# The Model 2 family is what identifies WHICH axis drives the between-stratum
-# variance. Fitting Model A and Model B alone establishes that between-stratum
-# variation is largely additive but says nothing about its composition; a PCV
-# of 97% could be almost entirely frailty, or evenly spread across all five
-# axes, and those imply very different things substantively.
+# What they do: one model per axis, each adding a single axis to the null
+# model, so the PCV isolates that axis's contribution. This says something
+# Model A and Model B cannot -- a PCV of 97% could be almost entirely frailty
+# or evenly spread across five axes.
+#
+# IMPORTANT CAVEAT. The Evans et al. tutorial (section 2.4.C.i) explicitly
+# warns that attending to individual axis contributions "seems to result in
+# reversion to single-axis thinking about inequity (e.g., asking whether the
+# effect of race(ism) is more important than income inequality) ... which is
+# counter to the stated purpose of intersectional comparisons". This output is
+# therefore secondary and descriptive. It should not displace the collective
+# additive effect and the total stratum predictions, which are the point of the
+# analysis. The caveat is carried into the generated manuscript text.
 #
 # One model is fitted per axis per outcome, so this multiplies the fitting work
-# by roughly the number of axes. It is well worth it, but it is the first thing
-# to switch off when iterating.
+# by roughly the number of axes. It is the first thing to switch off when
+# iterating.
 RUN_AXIS_DECOMPOSITION <- env_flag("MAIHDA_AXIS_DECOMPOSITION", default = TRUE)
 
 # --- Uncertainty intervals for the variance components ----------------------
@@ -1525,10 +1537,12 @@ build_model_formulae <- function(model_axes) {
   list(a = formula_a, b = formula_b)
 }
 
-# --- Model 2 family: per-axis variance decomposition -------------------------
-# One partially adjusted model per axis, each adding a single axis to the null
-# model. The proportional change in variance from Model A gives that axis's
-# individual contribution to the between-stratum variance.
+# --- Partially adjusted single-axis models -----------------------------------
+# One model per axis, each adding a single axis to the null model. The
+# proportional change in variance from Model A gives that axis's individual
+# contribution to the between-stratum variance. See the caveat in section 1:
+# this is a secondary, descriptive output and invites single-axis reading if
+# given more weight than the collective additive effect.
 #
 # The contributions do not sum to the Model B PCV, and are not meant to: the
 # axes are correlated in the population, so their separate contributions
@@ -1544,7 +1558,7 @@ fit_axis_decomposition <- function(strata, model_axes, variance_a,
       "cbind(events, non_events) ~", axis, "+ (1 | stratum)"
     ))
     attempt <- tryCatch(
-      fit_glmer_robust(axis_formula, strata, paste0("Model 2: ", axis)),
+      fit_glmer_robust(axis_formula, strata, paste0("single-axis: ", axis)),
       error = function(condition) NULL
     )
     if (is.null(attempt)) {
@@ -3062,11 +3076,13 @@ if (!is.null(word_axis_decomposition)) {
     data = word_axis_decomposition,
     note = paste(
       "Each row reports a partially adjusted model containing the null model",
-      "plus a single axis (the Model 2 family of the standard MAIHDA",
-      "sequence). PCV is the proportional reduction in between-stratum",
+      "plus a single axis. PCV is the proportional reduction in between-stratum",
       "variance attributable to that axis alone. Contributions overlap and do",
       "not sum to the fully adjusted PCV, because the axes are correlated in",
-      "the population."
+      "the population. This table is secondary and descriptive: attending to",
+      "individual axis contributions invites a reversion to single-axis",
+      "thinking, which is counter to the purpose of an intersectional",
+      "analysis. It should not displace the collective additive effect."
     ),
     filename = "Table_10_axis_variance_decomposition.docx", font_size = 8
   )
