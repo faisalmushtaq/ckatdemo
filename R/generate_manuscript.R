@@ -1272,7 +1272,7 @@ build_results <- function() {
           " events) carried an absolute risk due to interaction of ",
           fmt_num(abs(100 * row$interaction_probability_difference), 1),
           " percentage points ", direction,
-          " than its additive prediction (95% CI ",
+          " than its additive prediction (", INTERVAL_SHORT, " ",
           fmt_num(100 * row$interaction_probability_difference_low, 1), " to ",
           fmt_num(100 * row$interaction_probability_difference_high, 1),
           "; q ", fmt_p(row$interaction_q_value), ")"
