@@ -41,13 +41,38 @@ To generate test data first:
 Rscript tools/make_simulated_analysis_master.R work/simulated_analysis_master.rds 60000
 ```
 
+## Outcome-specific observability
+
+Each outcome is analysed only on the records where it could actually have been
+ascertained. The flag name is derived from the outcome:
+
+```
+event_<window>d_<type>  ->  observable_<window>_<type>
+```
+
+so `event_365d_fall` uses `observable_365_fall`. Non-conforming names go in
+`OUTCOME_ELIGIBILITY_OVERRIDES`. Analysing an outcome on unobservable records
+would treat "not under observation" as "did not happen", biasing risks
+downwards and unevenly across strata.
+
+Coverage per outcome is reported in `outcome_observability_audit.csv`, which
+also warns if any events occur among records flagged unobservable — that means
+the flag and the outcome disagree.
+
 ## Intersectional strata
 
-Strata are defined by five axes:
+Two specifications run automatically and are compared throughout:
 
-```
-age_band x sex x ethnicity x imd_quintile x efi_category
-```
+| | Axes |
+| --- | --- |
+| **Detailed** | `age_band × sex × ethnicity × imd_quintile × efi_category` |
+| **Collapsed** | `age_3cat × sex × ethnicity_4cat × imd_3cat × efi_category` |
+
+Collapsing trades resolution for precision — fewer, larger strata, tighter
+estimates, less lost to the cell-size rule. On test data: detailed retained
+521 of 985 strata and 95.9% of individuals; collapsed retained 257 of 288 and
+**99.7%**. Frailty is left uncollapsed so exactly one thing differs per axis;
+swap `efi_category` for `efi_category_3` to collapse it too.
 
 Opioid strength is deliberately **not** a stratum axis. It is a treatment
 characteristic rather than a social position, and folding an exposure into the
@@ -189,6 +214,23 @@ Every exclusion is accounted for in `stratum_retention.csv` and
 `excluded_strata.csv`, and a sensitivity sweep refits the models across a
 range of thresholds so the choice can be shown to be immaterial rather than
 merely asserted to be.
+
+## Interaction artefact checks
+
+A "significant" interaction can be an artefact. Every stratum whose interval
+excludes zero is checked and written to `interaction_quality_checks.csv` with
+a plain-language verdict:
+
+- **Scale compression** — near probability 0 or 1 the logistic curve is flat,
+  so a stratum pinned near the ceiling *cannot* move up and shows a negative
+  residual by arithmetic. Flagged when the additive probability is extreme and
+  the probability-scale effect is small relative to its log-odds residual.
+- **Precision-driven** — only large strata have intervals tight enough to
+  exclude zero, so significance tracks size. Flagged in the top decile of n.
+- **Marginal interval** — the interval only just clears zero.
+
+Flagged strata appear as **open circles** in Panel E with a caption pointing at
+the CSV, so an artefact can't be read as a finding.
 
 ## Singular fits
 

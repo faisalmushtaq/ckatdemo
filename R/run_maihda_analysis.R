@@ -466,8 +466,8 @@ SENSITIVITY_OUTCOME <- Sys.getenv(
 # added without touching any other part of the script; every loop, table and
 # figure iterates over whatever is defined here.
 SPECIFICATIONS <- list(
-  main = list(
-    label = "Intersectional strata",
+  detailed = list(
+    label = "Detailed categories",
     axes = c("age_band", "sex", "ethnicity", "imd_quintile", "efi_category"),
     references = c(
       age_band = "65-69",
@@ -476,8 +476,51 @@ SPECIFICATIONS <- list(
       imd_quintile = "1 (Least deprived)",
       efi_category = "Fit"
     )
+  ),
+  # The collapsed specification trades resolution for precision. Coarser
+  # categories produce fewer, larger strata, which tightens every stratum
+  # estimate and reduces the share of the cohort lost to the minimum cell rule.
+  # Running both and comparing is the honest way to show that the conclusions
+  # are not an artefact of how finely the axes were cut.
+  #
+  # Frailty is left uncollapsed here so that exactly one thing differs per
+  # axis. To collapse it too, change efi_category to efi_category_3 and its
+  # reference to the corresponding level.
+  collapsed = list(
+    label = "Collapsed categories",
+    axes = c("age_3cat", "sex", "ethnicity_4cat", "imd_3cat", "efi_category"),
+    references = c(
+      age_3cat = "65-74",
+      sex = "Male",
+      ethnicity_4cat = "White",
+      imd_3cat = "Q1-Q2",
+      efi_category = "Fit"
+    )
   )
 )
+
+# --- Outcome-specific observability ------------------------------------------
+# Each outcome has an observability flag naming the records for which that
+# outcome could actually have been ascertained. Analysing an outcome on records
+# where it was unobservable would treat "not observed because the person was
+# not under observation" as "did not happen", which biases every risk downwards
+# and does so unevenly across strata.
+#
+# The flag name is derived from the outcome name by the rule
+#   event_<window>d_<type>  ->  observable_<window>_<type>
+# so event_365d_fall uses observable_365_fall. Any outcome whose flag does not
+# follow that pattern can be named explicitly in OUTCOME_ELIGIBILITY_OVERRIDES.
+derive_eligibility_column <- function(outcome) {
+  sub("^event_([0-9]+)d_(.+)$", "observable_\\1_\\2", outcome)
+}
+OUTCOME_ELIGIBILITY_OVERRIDES <- c(
+  # example: event_90d_any = "observable_90_any_custom"
+)
+
+# Set to FALSE only to reproduce an earlier unfiltered run; it is not a
+# defensible analysis choice.
+APPLY_OBSERVABILITY_FILTER <- env_flag("MAIHDA_OBSERVABILITY_FILTER",
+                                       default = TRUE)
 
 # =============================================================================
 # 2. PACKAGE AND FILE SET-UP
@@ -792,6 +835,84 @@ for (axis in all_axes) {
     stop("Axis ", axis, " has ", distinct_n, " distinct values, which is too ",
          "many for an intersectional stratum. Check that it is categorical.")
   }
+}
+
+# --- Resolve and validate the observability flags ---------------------------
+OUTCOME_ELIGIBILITY <- vapply(names(OUTCOME_LABELS), function(outcome) {
+  if (outcome %in% names(OUTCOME_ELIGIBILITY_OVERRIDES)) {
+    unname(OUTCOME_ELIGIBILITY_OVERRIDES[outcome])
+  } else {
+    derive_eligibility_column(outcome)
+  }
+}, character(1))
+
+if (APPLY_OBSERVABILITY_FILTER) {
+  absent_flags <- OUTCOME_ELIGIBILITY[!OUTCOME_ELIGIBILITY %in% names(analysis_master)]
+  if (length(absent_flags) > 0L) {
+    stop(
+      "Observability flags are missing from the data: ",
+      paste(unique(absent_flags), collapse = ", "),
+      "\nThese are derived from the outcome names by the rule ",
+      "event_<window>d_<type> -> observable_<window>_<type>. If your columns ",
+      "are named differently, set them in OUTCOME_ELIGIBILITY_OVERRIDES near ",
+      "the top of the script, or set MAIHDA_OBSERVABILITY_FILTER=0 to disable ",
+      "filtering entirely."
+    )
+  }
+  # Coerced through the same routine as the outcomes, so logical, 0/1 numeric
+  # and "0"/"1" character columns are all accepted and anything else is a
+  # clear error rather than a silent misreading.
+  for (flag in unique(OUTCOME_ELIGIBILITY)) {
+    analysis_master[[flag]] <- coerce_binary_outcome(analysis_master[[flag]],
+                                                     flag)
+    if (all(analysis_master[[flag]] == 0, na.rm = TRUE)) {
+      stop("Observability flag ", flag, " is FALSE for every record.")
+    }
+  }
+
+  eligibility_audit <- bind_rows(lapply(names(OUTCOME_LABELS), function(outcome) {
+    flag <- unname(OUTCOME_ELIGIBILITY[outcome])
+    values <- analysis_master[[flag]]
+    eligible <- !is.na(values) & values == 1
+    outcome_values <- analysis_master[[outcome]]
+    data.frame(
+      outcome = outcome,
+      outcome_label = unname(OUTCOME_LABELS[outcome]),
+      eligibility_column = flag,
+      total_n = length(values),
+      observable_n = sum(eligible),
+      unobservable_n = sum(!eligible),
+      observable_percent = 100 * mean(eligible),
+      # Events occurring among records flagged unobservable indicate the flag
+      # and the outcome disagree, which is worth knowing before modelling.
+      events_among_unobservable = sum(!eligible & !is.na(outcome_values) &
+                                        outcome_values == 1)
+    )
+  }))
+  write_csv_output(eligibility_audit,
+                   file.path(OUTPUT_ROOT, "tables",
+                             "outcome_observability_audit.csv"))
+
+  for (row_index in seq_len(nrow(eligibility_audit))) {
+    row <- eligibility_audit[row_index, ]
+    log_message("Observability: ", row$outcome_label, " uses ",
+                row$eligibility_column, "; ", format(row$observable_n,
+                                                     big.mark = ","),
+                " of ", format(row$total_n, big.mark = ","), " records (",
+                formatC(row$observable_percent, format = "f", digits = 1),
+                "%).")
+    if (row$events_among_unobservable > 0L) {
+      log_message("  ", row$events_among_unobservable, " events occur among ",
+                  "records flagged unobservable for this outcome. The flag ",
+                  "and the outcome disagree; check the derivation.",
+                  level = "WARN")
+    }
+  }
+} else {
+  log_message("Observability filtering is DISABLED. Every outcome will use ",
+              "the full cohort.", level = "WARN")
+  OUTCOME_ELIGIBILITY <- setNames(rep(NA_character_, length(OUTCOME_LABELS)),
+                                  names(OUTCOME_LABELS))
 }
 
 input_audit <- data.frame(
@@ -1687,6 +1808,55 @@ make_stratum_predictions <- function(model_a, model_b, strata_data,
     !is.na(prediction$interaction_q_value) &
     prediction$interaction_q_value < FDR_LEVEL
 
+  # --- Artefact diagnostics for the interaction residuals --------------------
+  # An interaction that is "significant" can be an artefact of the probability
+  # scale or of precision rather than a real departure from additivity. Three
+  # checks travel with every stratum so a finding can be interrogated rather
+  # than taken at face value.
+  #
+  # 1. Scale compression. Near a predicted probability of 0 or 1 the logistic
+  #    curve is flat, so a given shift in log-odds maps to a small shift in
+  #    probability, and conversely a stratum pinned near the ceiling cannot
+  #    move upwards. A sizeable probability-scale ARI accompanied by a
+  #    negligible log-odds residual is compression, not interaction.
+  # 2. Precision-driven detection. Only a well-populated stratum has intervals
+  #    tight enough to exclude zero, so significance tracks size. A stratum
+  #    among the largest in the analysis warrants a check that the effect is
+  #    substantively meaningful and not merely well measured.
+  # 3. Marginal magnitude. An interval that only just excludes zero is far
+  #    weaker evidence than one clear of it.
+  prediction <- prediction %>%
+    mutate(
+      additive_probability_extreme =
+        additive_probability > 0.80 | additive_probability < 0.05,
+      # Ratio of the probability-scale effect to what the same log-odds shift
+      # would produce at a predicted probability of 0.5, where the logistic
+      # curve is steepest. Values well below 1 indicate compression.
+      scale_compression_ratio = ifelse(
+        abs(interaction_log_odds) > 1e-8,
+        abs(interaction_probability_difference) /
+          abs(inv_logit(interaction_log_odds) - 0.5),
+        NA_real_
+      ),
+      possible_ceiling_artefact =
+        interaction_distinguishable &
+        additive_probability_extreme &
+        !is.na(scale_compression_ratio) & scale_compression_ratio < 0.5,
+      stratum_size_percentile = 100 * rank(n) / length(n),
+      precision_driven = interaction_distinguishable &
+        stratum_size_percentile >= 90,
+      interval_excludes_zero_marginally = interaction_distinguishable &
+        pmin(abs(interaction_log_odds_low), abs(interaction_log_odds_high)) <
+          0.1 * abs(interaction_log_odds),
+      artefact_flags = paste0(
+        ifelse(possible_ceiling_artefact, "scale-compression;", ""),
+        ifelse(precision_driven, "precision-driven;", ""),
+        ifelse(interval_excludes_zero_marginally, "marginal-interval;", "")
+      ),
+      artefact_flags = ifelse(nzchar(artefact_flags),
+                              sub(";$", "", artefact_flags), "")
+    )
+
   prediction %>%
     select(
       specification, specification_label, outcome, outcome_label,
@@ -1699,6 +1869,9 @@ make_stratum_predictions <- function(model_a, model_b, strata_data,
       interaction_probability_difference_low,
       interaction_probability_difference_high,
       absolute_risk, absolute_risk_due_to_interaction,
+      additive_probability_extreme, scale_compression_ratio,
+      possible_ceiling_artefact, stratum_size_percentile, precision_driven,
+      interval_excludes_zero_marginally, artefact_flags,
       interaction_z, interaction_p_value, interaction_q_value,
       interaction_distinguishable, interaction_distinguishable_fdr,
       prediction_rank, interaction_rank
@@ -1811,6 +1984,55 @@ make_stratum_predictions_bayesian <- function(model_a, model_b, strata_data,
     !is.na(prediction$interaction_q_value) &
     prediction$interaction_q_value < FDR_LEVEL
 
+  # --- Artefact diagnostics for the interaction residuals --------------------
+  # An interaction that is "significant" can be an artefact of the probability
+  # scale or of precision rather than a real departure from additivity. Three
+  # checks travel with every stratum so a finding can be interrogated rather
+  # than taken at face value.
+  #
+  # 1. Scale compression. Near a predicted probability of 0 or 1 the logistic
+  #    curve is flat, so a given shift in log-odds maps to a small shift in
+  #    probability, and conversely a stratum pinned near the ceiling cannot
+  #    move upwards. A sizeable probability-scale ARI accompanied by a
+  #    negligible log-odds residual is compression, not interaction.
+  # 2. Precision-driven detection. Only a well-populated stratum has intervals
+  #    tight enough to exclude zero, so significance tracks size. A stratum
+  #    among the largest in the analysis warrants a check that the effect is
+  #    substantively meaningful and not merely well measured.
+  # 3. Marginal magnitude. An interval that only just excludes zero is far
+  #    weaker evidence than one clear of it.
+  prediction <- prediction %>%
+    mutate(
+      additive_probability_extreme =
+        additive_probability > 0.80 | additive_probability < 0.05,
+      # Ratio of the probability-scale effect to what the same log-odds shift
+      # would produce at a predicted probability of 0.5, where the logistic
+      # curve is steepest. Values well below 1 indicate compression.
+      scale_compression_ratio = ifelse(
+        abs(interaction_log_odds) > 1e-8,
+        abs(interaction_probability_difference) /
+          abs(inv_logit(interaction_log_odds) - 0.5),
+        NA_real_
+      ),
+      possible_ceiling_artefact =
+        interaction_distinguishable &
+        additive_probability_extreme &
+        !is.na(scale_compression_ratio) & scale_compression_ratio < 0.5,
+      stratum_size_percentile = 100 * rank(n) / length(n),
+      precision_driven = interaction_distinguishable &
+        stratum_size_percentile >= 90,
+      interval_excludes_zero_marginally = interaction_distinguishable &
+        pmin(abs(interaction_log_odds_low), abs(interaction_log_odds_high)) <
+          0.1 * abs(interaction_log_odds),
+      artefact_flags = paste0(
+        ifelse(possible_ceiling_artefact, "scale-compression;", ""),
+        ifelse(precision_driven, "precision-driven;", ""),
+        ifelse(interval_excludes_zero_marginally, "marginal-interval;", "")
+      ),
+      artefact_flags = ifelse(nzchar(artefact_flags),
+                              sub(";$", "", artefact_flags), "")
+    )
+
   prediction %>%
     select(
       specification, specification_label, outcome, outcome_label,
@@ -1823,6 +2045,9 @@ make_stratum_predictions_bayesian <- function(model_a, model_b, strata_data,
       interaction_probability_difference_low,
       interaction_probability_difference_high,
       absolute_risk, absolute_risk_due_to_interaction,
+      additive_probability_extreme, scale_compression_ratio,
+      possible_ceiling_artefact, stratum_size_percentile, precision_driven,
+      interval_excludes_zero_marginally, artefact_flags,
       interaction_probability_of_direction,
       interaction_z, interaction_p_value, interaction_q_value,
       interaction_distinguishable, interaction_distinguishable_fdr,
@@ -2160,7 +2385,8 @@ fit_axis_decomposition <- function(strata, model_axes, variance_a,
 fit_one_maihda <- function(strata, axes, model_axes, specification,
                            specification_label, outcome, outcome_label,
                            included_n, excluded_n, possible_strata,
-                           accounting) {
+                           accounting, eligibility_column = NA_character_,
+                           observable_n = NA_integer_) {
   log_message("  Fitting ", specification, " / ", outcome,
               " (", nrow(strata), " strata, ", sum(strata$n), " individuals)")
 
@@ -2344,6 +2570,8 @@ fit_one_maihda <- function(strata, axes, model_axes, specification,
     outcome_label = outcome_label,
     min_stratum_n = MIN_STRATUM_N,
     min_stratum_events = MIN_STRATUM_EVENTS,
+    eligibility_column = eligibility_column,
+    observable_n = observable_n,
     included_n = included_n,
     excluded_n = excluded_n,
     analysed_n = sum(strata$n),
@@ -2787,7 +3015,11 @@ make_figures <- function(predictions, metrics_row) {
       aes(ymin = total_probability_low, ymax = total_probability_high),
       colour = "grey65", linewidth = 0.25, alpha = 0.7
     ) +
-    geom_point(colour = colour_predicted, size = 0.7) +
+    # Point size carries the stratum size, so the reader can see immediately
+    # whether a position on the gradient rests on many people or few. Without
+    # it every stratum looks equally well established.
+    geom_point(aes(size = n), colour = colour_predicted, alpha = 0.75) +
+    scale_size_sqrt_compatible(range = c(0.5, 3.6)) +
     ggrepel::geom_text_repel(
       data = prediction_labels,
       aes(label = condition_plot_label),
@@ -2800,8 +3032,9 @@ make_figures <- function(predictions, metrics_row) {
     labs(
       title = "B. Predicted risk by intersectional stratum",
       subtitle = paste0("Model B: additive main effects plus stratum random ",
-                        "effect. Bars are ", INTERVAL_SHORT, "."),
-      x = "Stratum rank", y = "Predicted event probability"
+                        "effect. Bars are ", INTERVAL_SHORT,
+                        "; point size is stratum n."),
+      x = "Stratum rank", y = "Predicted event probability", size = "Stratum n"
     ) + publication_theme
 
   # Panel C shows the stratum interaction residual on the probability scale.
@@ -2881,9 +3114,12 @@ make_figures <- function(predictions, metrics_row) {
   significant_interactions <- predictions %>%
     filter(interaction_distinguishable_fdr) %>%
     arrange(interaction_probability_difference) %>%
-    mutate(condition_plot_label = factor(
-      condition_plot_label, levels = unique(condition_plot_label)
-    ))
+    mutate(
+      flagged = nzchar(artefact_flags),
+      condition_plot_label = factor(
+        condition_plot_label, levels = unique(condition_plot_label)
+      )
+    )
 
   n_uncorrected <- sum(predictions$interaction_distinguishable)
 
@@ -2899,7 +3135,13 @@ make_figures <- function(predictions, metrics_row) {
             xmax = interaction_probability_difference_high),
         orientation = "y", width = 0, linewidth = 0.45
       ) +
-      geom_point(size = 2.4) +
+      geom_point(aes(shape = flagged), size = 2.6) +
+      scale_shape_manual(
+        values = c(`FALSE` = 16, `TRUE` = 1),
+        labels = c(`FALSE` = "No artefact flag",
+                   `TRUE` = "Flagged: check before interpreting"),
+        drop = FALSE
+      ) +
       scale_colour_manual(
         values = c(`FALSE` = unname(nature_colours["blue"]),
                    `TRUE` = unname(nature_colours["vermillion"])),
@@ -2917,11 +3159,20 @@ make_figures <- function(predictions, metrics_row) {
           " (", n_uncorrected, " before correction)"
         ),
         x = "Difference from additive predicted probability", y = NULL,
-        colour = NULL
+        colour = NULL, shape = NULL,
+        caption = if (any(significant_interactions$flagged)) {
+          paste0("Open circles carry an artefact flag (scale compression, ",
+                 "precision-driven, or a marginal interval).\nSee ",
+                 "interaction_quality_checks.csv before interpreting them.")
+        } else {
+          "No stratum carries an artefact flag."
+        }
       ) + publication_theme +
       theme(axis.text.y = element_text(size = LABEL_SIZE_AXIS,
                                        lineheight = 1.05),
-            legend.position = "bottom")
+            legend.position = "bottom", legend.box = "vertical",
+            plot.caption = element_text(size = 8, colour = "grey35",
+                                        hjust = 0))
   } else {
     p_significant <- empty_panel(
       "E. Intersectional interaction residuals surviving FDR correction",
@@ -2964,10 +3215,6 @@ make_figures <- function(predictions, metrics_row) {
       size = "Stratum n"
     ) + publication_theme
 
-  combined_four <- (p_distribution | p_caterpillar) /
-    (p_interaction | p_shrinkage) +
-    plot_annotation(title = title_suffix, tag_levels = NULL)
-
   combined_five <- (p_distribution | p_caterpillar) /
     (p_interaction | p_shrinkage) /
     p_significant +
@@ -2982,7 +3229,6 @@ make_figures <- function(predictions, metrics_row) {
     interaction = p_interaction,
     shrinkage = p_shrinkage,
     significant = p_significant,
-    combined_four = combined_four,
     combined_five = combined_five,
     n_significant = nrow(significant_interactions)
   )
@@ -3094,7 +3340,28 @@ for (specification_name in names(SPECIFICATIONS)) {
         }
         "skipped"
       } else {
-        counted <- make_stratum_counts(prepared, axes, outcome)
+        # The observability filter is applied per outcome, so each model uses
+        # exactly the records for which its outcome could have been observed.
+        # prepare_analysis_data preserves row order and row count, so the
+        # eligibility index computed on analysis_master aligns directly.
+        eligibility_column <- unname(OUTCOME_ELIGIBILITY[outcome])
+        if (!is.na(eligibility_column)) {
+          eligible_rows <- !is.na(analysis_master[[eligibility_column]]) &
+            analysis_master[[eligibility_column]] == 1
+          outcome_data <- prepared[eligible_rows, , drop = FALSE]
+          log_message("  Observable records: ",
+                      format(sum(eligible_rows), big.mark = ","), " of ",
+                      format(nrow(prepared), big.mark = ","), " (",
+                      formatC(100 * mean(eligible_rows), format = "f",
+                              digits = 1), "%), using ", eligibility_column, ".")
+        } else {
+          outcome_data <- prepared
+        }
+        if (nrow(outcome_data) == 0L) {
+          stop("No observable records remain for ", outcome, ".")
+        }
+
+        counted <- make_stratum_counts(outcome_data, axes, outcome)
 
         all_size_summaries[[paste0(result_key, "__before")]] <-
           stratum_size_summary(
@@ -3184,7 +3451,7 @@ for (specification_name in names(SPECIFICATIONS)) {
           ruled$data, axes, ruled$model_axes, specification_name,
           specification$label, outcome, outcome_label,
           counted$included_n, counted$excluded_n, counted$possible_strata,
-          ruled$accounting
+          ruled$accounting, eligibility_column, nrow(outcome_data)
         )
 
         all_metrics[[result_key]] <- fit$metrics
@@ -3254,12 +3521,6 @@ for (specification_name in names(SPECIFICATIONS)) {
         save_plot_pair(figure_list$significant,
                        paste0(figure_prefix, "__E_significant_interactions"),
                        width = 10.5, height = significant_height)
-        save_plot_pair(
-          figure_list$combined_four,
-          file.path(OUTPUT_ROOT, "figures", "multipanel",
-                    paste0(specification_name, "__", outcome, "__four_panel")),
-          width = 15, height = 11
-        )
         save_plot_pair(
           figure_list$combined_five,
           file.path(OUTPUT_ROOT, "figures", "multipanel",
@@ -3418,6 +3679,49 @@ write_csv_output(retention_table,
                  file.path(OUTPUT_ROOT, "tables", "stratum_retention.csv"))
 write_csv_output(fit_attempts_table,
                  file.path(OUTPUT_ROOT, "tables", "model_fit_attempts.csv"))
+
+# Every stratum whose interval excludes zero, corrected or not, with the
+# information needed to judge whether the finding is real. Written even when
+# empty, because "nothing to check" is itself a useful thing to be able to
+# point at.
+interaction_quality_checks <- predictions_table %>%
+  filter(interaction_distinguishable | interaction_distinguishable_fdr) %>%
+  transmute(
+    specification_label, outcome_label, stratum = condition_label,
+    n, events,
+    additive_probability, total_probability,
+    absolute_risk_due_to_interaction,
+    interaction_log_odds, interaction_q_value,
+    survives_fdr = interaction_distinguishable_fdr,
+    additive_probability_extreme, scale_compression_ratio,
+    possible_ceiling_artefact, stratum_size_percentile, precision_driven,
+    interval_excludes_zero_marginally, artefact_flags,
+    verdict = case_when(
+      !interaction_distinguishable_fdr ~ "does not survive FDR correction",
+      possible_ceiling_artefact ~
+        "likely scale compression near the probability boundary",
+      precision_driven & abs(absolute_risk_due_to_interaction) < 0.01 ~
+        "detected by precision; effect is small in absolute terms",
+      interval_excludes_zero_marginally ~ "interval only marginally excludes zero",
+      TRUE ~ "no artefact flag raised"
+    )
+  ) %>%
+  arrange(specification_label, outcome_label,
+          desc(abs(absolute_risk_due_to_interaction)))
+
+write_csv_output(interaction_quality_checks,
+                 file.path(OUTPUT_ROOT, "tables",
+                           "interaction_quality_checks.csv"))
+
+flagged_total <- sum(nzchar(interaction_quality_checks$artefact_flags) &
+                       interaction_quality_checks$survives_fdr)
+if (flagged_total > 0L) {
+  log_message(flagged_total, " FDR-surviving ",
+              if (flagged_total == 1L) "interaction carries" else
+                "interactions carry",
+              " an artefact flag. See interaction_quality_checks.csv.",
+              level = "NOTE")
+}
 if (nrow(axis_decomposition_table) > 0L) {
   write_csv_output(axis_decomposition_table,
                    file.path(OUTPUT_ROOT, "tables",

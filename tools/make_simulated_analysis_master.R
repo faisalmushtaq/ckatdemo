@@ -245,6 +245,47 @@ analysis_master$imd_3cat <- factor(
   analysis_master$imd_3cat, levels = c("Q1-Q2", "Q3", "Q4-Q5")
 )
 
+# -----------------------------------------------------------------------------
+# 7. Outcome observability flags
+# -----------------------------------------------------------------------------
+# Each outcome carries a flag naming the records for which it could actually
+# have been ascertained -- typically those with sufficient follow-up and no
+# competing censoring event. Coverage is deliberately made outcome-specific and
+# slightly lower at 365 days than at 90, which is what real follow-up looks
+# like and which exercises the per-outcome filtering in the analysis script.
+
+observability_for <- function(base_probability) {
+  as.integer(runif(n_rows) < base_probability)
+}
+
+for (window in c(90, 365)) {
+  base <- if (window == 90) 0.97 else 0.91
+  for (event_type in c("any", "nonfatal", "fall", "fracture", "delirium",
+                       "death")) {
+    flag_name <- paste0("observable_", window, "_", event_type)
+    analysis_master[[flag_name]] <- observability_for(base)
+  }
+}
+
+# Anyone with the event recorded must be observable for it, or the flag and the
+# outcome would contradict each other.
+for (window in c(90, 365)) {
+  for (event_type in c("any", "nonfatal", "fall", "fracture", "delirium",
+                       "death")) {
+    flag_name <- paste0("observable_", window, "_", event_type)
+    outcome_name <- paste0("event_", window, "d_", event_type)
+    analysis_master[[flag_name]][analysis_master[[outcome_name]] == 1] <- 1L
+  }
+}
+
+# Additional collapsed and derived variables present in the real
+# analysis_master, so the collapsed specification can be exercised.
+analysis_master$ethnicity_5cat <- analysis_master$ethnicity
+analysis_master$omeq_quartile <- factor(
+  sample(c("Q1", "Q2", "Q3", "Q4"), n_rows, replace = TRUE),
+  levels = c("Q1", "Q2", "Q3", "Q4")
+)
+
 saveRDS(analysis_master, output_path)
 
 outcome_names <- grep("^event_", names(analysis_master), value = TRUE)
